@@ -37,6 +37,8 @@ const TOKENS_STOPS: &[(u8, u8, u8)] = &[
 const TTFT_STOPS: &[(u8, u8, u8)] = &[(74, 222, 128), (250, 204, 21), (248, 113, 113)];
 /// Cache meter fill, left → right (a full bar ends green).
 const CACHE_STOPS: &[(u8, u8, u8)] = &[(248, 113, 113), (250, 204, 21), (74, 222, 128)];
+/// Context-growth area graph, bottom → top: gold into warning red.
+const CONTEXT_STOPS: &[(u8, u8, u8)] = &[(202, 138, 4), (245, 158, 11), (248, 113, 113)];
 
 fn gradient(stops: &[(u8, u8, u8)], t: f32) -> Color {
     let last = stops.len() - 1;
@@ -149,18 +151,26 @@ impl Widget for GradientBars<'_> {
     }
 }
 
-fn cache_meter(pct: f64, segments: usize) -> Vec<Span<'static>> {
-    let filled = ((pct / 100.0) * segments as f64).round() as usize;
-    let mut spans: Vec<Span> = (0..segments)
+/// btop-style meter: filled cells colored by a position gradient.
+fn meter_spans(frac: f64, segments: usize, stops: &[(u8, u8, u8)]) -> Vec<Span<'static>> {
+    let mut filled = (frac.clamp(0.0, 1.0) * segments as f64).round() as usize;
+    if filled == 0 && frac > 0.001 {
+        filled = 1; // anything non-negligible shows at least one cell
+    }
+    (0..segments)
         .map(|i| {
             if i < filled {
                 let t = i as f32 / (segments - 1).max(1) as f32;
-                Span::styled("█", Style::new().fg(gradient(CACHE_STOPS, t)))
+                Span::styled("█", Style::new().fg(gradient(stops, t)))
             } else {
                 Span::styled("░", Style::new().fg(BORDER))
             }
         })
-        .collect();
+        .collect()
+}
+
+fn cache_meter(pct: f64, segments: usize) -> Vec<Span<'static>> {
+    let mut spans = meter_spans(pct / 100.0, segments, CACHE_STOPS);
     spans.push(Span::styled(
         format!(" {pct:>3.0}%"),
         Style::new().fg(if pct >= 50.0 {
@@ -336,13 +346,21 @@ fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    let [header, graphs, table, footer] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(9),
-        Constraint::Min(4),
-        Constraint::Length(1),
-    ])
-    .areas(f.area());
+    // Dense btop-style grid when there is room; the second panel row folds
+    // away on short terminals to keep the request table usable.
+    let dense = f.area().height >= 34;
+    let mut constraints = vec![Constraint::Length(3), Constraint::Length(9)];
+    if dense {
+        constraints.push(Constraint::Length(8));
+    }
+    constraints.extend([Constraint::Min(4), Constraint::Length(1)]);
+    let chunks = Layout::vertical(constraints).split(f.area());
+    let (header, graphs) = (chunks[0], chunks[1]);
+    let (second, table, footer) = if dense {
+        (Some(chunks[2]), chunks[3], chunks[4])
+    } else {
+        (None, chunks[2], chunks[3])
+    };
 
     draw_header(f, app, header);
 
@@ -350,6 +368,13 @@ fn draw(f: &mut Frame, app: &mut App) {
         Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(graphs);
     draw_tokens_per_sec(f, app, left);
     draw_ttft(f, app, right);
+    if let Some(second) = second {
+        let [ctx, models] =
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .areas(second);
+        draw_context_growth(f, app, ctx);
+        draw_models(f, app, models);
+    }
     draw_table(f, app, table);
 
     f.render_widget(
@@ -727,6 +752,105 @@ fn draw_ttft(f: &mut Frame, app: &App, area: Rect) {
         },
         inner,
     );
+}
+
+/// Total input (billed + cached + written) per request over time — the shape
+/// of the agent's context growing turn by turn. One character column per
+/// request, newest right.
+fn draw_context_growth(f: &mut Frame, app: &App, area: Rect) {
+    let inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let mut vals: Vec<u64> = app
+        .records
+        .iter()
+        .take(inner_w * 2)
+        .map(|r| (r.input_tokens + r.cache_read_tokens + r.cache_write_tokens).max(0) as u64)
+        .collect();
+    vals.reverse();
+    let latest = vals.last().copied().unwrap_or(0);
+    // Index-based chart, not a time series: stretch the turns across the full
+    // panel width (and downsample once there are more turns than dot columns).
+    let dot_cols = inner_w * 2;
+    let data: Vec<u64> = if vals.is_empty() {
+        Vec::new()
+    } else {
+        (0..dot_cols)
+            .map(|i| vals[i * vals.len() / dot_cols])
+            .collect()
+    };
+
+    let block = panel(vec![
+        Span::styled(" context per turn ", Style::new().bold()),
+        Span::styled(format!("now {} tok ", fmt_tokens(latest as i64)), Style::new().fg(DIM)),
+    ]);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(
+        AreaGraph {
+            data: &data,
+            stops: CONTEXT_STOPS,
+            baseline: true,
+        },
+        inner,
+    );
+}
+
+/// Per-model spend, btop per-core style: meter is the share of the most
+/// expensive model.
+fn draw_models(f: &mut Frame, app: &App, area: Rect) {
+    use std::collections::HashMap;
+
+    let mut agg: HashMap<&str, (&str, f64, i64)> = HashMap::new();
+    for r in &app.records {
+        let e = agg.entry(r.model.as_str()).or_insert((r.provider.as_str(), 0.0, 0));
+        e.1 += r.cost_usd;
+        e.2 += r.input_tokens + r.cache_read_tokens + r.cache_write_tokens + r.output_tokens;
+    }
+    let mut models: Vec<(&str, &str, f64, i64)> = agg
+        .into_iter()
+        .map(|(m, (p, cost, tok))| (m, p, cost, tok))
+        .collect();
+    models.sort_by(|a, b| b.2.total_cmp(&a.2).then(b.3.cmp(&a.3)));
+    let total: f64 = models.iter().map(|m| m.2).sum();
+    let max_spend = models.first().map(|m| m.2).unwrap_or(0.0).max(1e-9);
+
+    let inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let name_w = 22usize;
+    let value_w = 18usize;
+    let meter_w = inner_w.saturating_sub(name_w + value_w).clamp(6, 30);
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let lines: Vec<Line> = models
+        .iter()
+        .take(visible)
+        .map(|(model, provider, cost, tok)| {
+            let color = match *provider {
+                "anthropic" => ANTHROPIC,
+                "openai" => OPENAI,
+                _ => ACCENT,
+            };
+            let name: String = model.chars().take(name_w - 2).collect();
+            let mut spans = vec![Span::styled(
+                format!(" {name:<width$}", width = name_w - 1),
+                Style::new().fg(color),
+            )];
+            spans.extend(meter_spans(cost / max_spend, meter_w, TOKENS_STOPS));
+            spans.push(Span::styled(
+                format!(" ${cost:.2}", ),
+                Style::new().fg(Color::Rgb(74, 222, 128)),
+            ));
+            spans.push(Span::styled(
+                format!(" · {} tok", fmt_tokens(*tok)),
+                Style::new().fg(DIM),
+            ));
+            Line::from(spans)
+        })
+        .collect();
+
+    let block = panel(vec![
+        Span::styled(" models ", Style::new().bold()),
+        Span::styled(format!("spend ${total:.2} ", ), Style::new().fg(DIM)),
+    ]);
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
