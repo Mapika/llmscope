@@ -38,8 +38,46 @@ impl AppState {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/_llmscope/requests", get(list_requests))
+        .route("/_llmscope/diff/{id}", get(get_diff))
         .fallback(proxy_handler)
         .with_state(state)
+}
+
+/// A request plus the previous request of the same provider/model/path —
+/// everything the TUI needs to render a turn diff. Bodies stay localhost-only.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct DiffPayload {
+    pub curr: RequestRecord,
+    pub curr_body: String,
+    pub prev: Option<RequestRecord>,
+    pub prev_body: Option<String>,
+}
+
+async fn get_diff(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Response {
+    let result = (|| -> anyhow::Result<Option<DiffPayload>> {
+        let Some((curr, curr_body)) = st.store.with_body(id, None)? else {
+            return Ok(None);
+        };
+        let prev = st.store.with_body(0, Some(&curr))?;
+        let (prev, prev_body) = match prev {
+            Some((r, b)) => (Some(r), Some(b)),
+            None => (None, None),
+        };
+        Ok(Some(DiffPayload {
+            curr,
+            curr_body,
+            prev,
+            prev_body,
+        }))
+    })();
+    match result {
+        Ok(Some(p)) => Json(p).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such request").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

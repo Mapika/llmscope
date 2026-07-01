@@ -3,14 +3,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::{Local, TimeZone};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table, Widget};
+use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table, TableState, Widget};
 
+use crate::diff;
+use crate::protocol::Provider;
+use crate::proxy::DiffPayload;
 use crate::record::RequestRecord;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
@@ -169,11 +172,26 @@ fn cache_meter(pct: f64, segments: usize) -> Vec<Span<'static>> {
     spans
 }
 
+enum View {
+    Dashboard,
+    Diff(DiffScreen),
+}
+
+struct DiffScreen {
+    title: String,
+    lines: Vec<Line<'static>>,
+    scroll: u16,
+}
+
 struct App {
     port: u16,
     records: VecDeque<RequestRecord>,
     last_id: i64,
     connected: bool,
+    /// Index into `records` (0 = newest) of the highlighted table row.
+    selected: usize,
+    table: TableState,
+    view: View,
 }
 
 pub async fn run(port: u16) -> Result<()> {
@@ -187,6 +205,9 @@ pub async fn run(port: u16) -> Result<()> {
         records: VecDeque::new(),
         last_id: 0,
         connected: false,
+        selected: 0,
+        table: TableState::default(),
+        view: View::Dashboard,
     };
 
     let mut terminal = ratatui::init();
@@ -198,17 +219,24 @@ pub async fn run(port: u16) -> Result<()> {
             match fetch(&client, &base, app.last_id).await {
                 Ok(new) => {
                     app.connected = true;
+                    let arrived = new.len();
                     for r in new {
                         app.last_id = app.last_id.max(r.id);
                         app.records.push_front(r);
                     }
                     app.records.truncate(5000);
+                    // Keep the highlight on the same record as new rows push
+                    // everything down; at the top it follows the newest.
+                    if arrived > 0 && app.selected > 0 {
+                        app.selected =
+                            (app.selected + arrived).min(app.records.len().saturating_sub(1));
+                    }
                 }
                 Err(_) => app.connected = false,
             }
         }
 
-        if let Err(e) = terminal.draw(|f| draw(f, &app)) {
+        if let Err(e) = terminal.draw(|f| draw(f, &mut app)) {
             break Err(e.into());
         }
 
@@ -216,10 +244,65 @@ pub async fn run(port: u16) -> Result<()> {
         // needing crossterm's async event stream.
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
+                // Windows delivers both press and release events.
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
                 let ctrl_c = key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL);
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) || ctrl_c {
+                if ctrl_c {
                     break Ok(());
+                }
+                match &mut app.view {
+                    View::Dashboard => match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.selected = app.selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.selected =
+                                (app.selected + 1).min(app.records.len().saturating_sub(1));
+                        }
+                        KeyCode::Enter | KeyCode::Char('d') => {
+                            if let Some(rec) = app.records.get(app.selected) {
+                                let screen = match fetch_diff(&client, &base, rec.id).await {
+                                    Ok(payload) => build_diff_screen(&payload),
+                                    Err(e) => DiffScreen {
+                                        title: format!("#{}", rec.id),
+                                        lines: vec![Line::from(Span::styled(
+                                            format!("could not load diff: {e}"),
+                                            Style::new().fg(Color::Rgb(248, 113, 113)),
+                                        ))],
+                                        scroll: 0,
+                                    },
+                                };
+                                app.view = View::Diff(screen);
+                            }
+                        }
+                        _ => {}
+                    },
+                    View::Diff(screen) => match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace => {
+                            app.view = View::Dashboard;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            screen.scroll = screen.scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            screen.scroll = screen
+                                .scroll
+                                .saturating_add(1)
+                                .min(screen.lines.len() as u16);
+                        }
+                        KeyCode::PageUp => screen.scroll = screen.scroll.saturating_sub(10),
+                        KeyCode::PageDown => {
+                            screen.scroll = screen
+                                .scroll
+                                .saturating_add(10)
+                                .min(screen.lines.len() as u16);
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
@@ -227,6 +310,12 @@ pub async fn run(port: u16) -> Result<()> {
 
     ratatui::restore();
     result
+}
+
+async fn fetch_diff(client: &reqwest::Client, base: &str, id: i64) -> Result<DiffPayload> {
+    let url = format!("{base}/_llmscope/diff/{id}");
+    let resp = client.get(url).send().await?.error_for_status()?;
+    Ok(resp.json().await?)
 }
 
 async fn fetch(client: &reqwest::Client, base: &str, since: i64) -> Result<Vec<RequestRecord>> {
@@ -241,7 +330,12 @@ fn panel(title: Vec<Span<'static>>) -> Block<'static> {
         .title(Line::from(title))
 }
 
-fn draw(f: &mut Frame, app: &App) {
+fn draw(f: &mut Frame, app: &mut App) {
+    if let View::Diff(screen) = &app.view {
+        draw_diff(f, screen);
+        return;
+    }
+
     let [header, graphs, table, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(9),
@@ -262,6 +356,10 @@ fn draw(f: &mut Frame, app: &App) {
         Line::from(vec![
             Span::styled("  q", Style::new().fg(ACCENT).bold()),
             Span::styled(" quit", Style::new().fg(DIM)),
+            Span::styled("   ↑↓", Style::new().fg(ACCENT).bold()),
+            Span::styled(" select", Style::new().fg(DIM)),
+            Span::styled("   ⏎", Style::new().fg(ACCENT).bold()),
+            Span::styled(" turn diff", Style::new().fg(DIM)),
             Span::styled(
                 format!("   proxy 127.0.0.1:{}", app.port),
                 Style::new().fg(DIM),
@@ -269,6 +367,212 @@ fn draw(f: &mut Frame, app: &App) {
         ]),
         footer,
     );
+}
+
+fn draw_diff(f: &mut Frame, screen: &DiffScreen) {
+    let [main, footer] =
+        Layout::vertical([Constraint::Min(4), Constraint::Length(1)]).areas(f.area());
+
+    let block = panel(vec![
+        Span::styled(" turn diff ", Style::new().fg(ACCENT).bold()),
+        Span::styled(format!("{} ", screen.title), Style::new().fg(DIM)),
+    ]);
+    let inner_h = main.height.saturating_sub(2);
+    let max_scroll = (screen.lines.len() as u16).saturating_sub(inner_h);
+    f.render_widget(
+        Paragraph::new(screen.lines.clone())
+            .block(block)
+            .scroll((screen.scroll.min(max_scroll), 0)),
+        main,
+    );
+    f.render_widget(
+        Line::from(vec![
+            Span::styled("  esc", Style::new().fg(ACCENT).bold()),
+            Span::styled(" back", Style::new().fg(DIM)),
+            Span::styled("   ↑↓", Style::new().fg(ACCENT).bold()),
+            Span::styled(" scroll", Style::new().fg(DIM)),
+        ]),
+        footer,
+    );
+}
+
+fn provider_of(r: &RequestRecord) -> Provider {
+    if r.provider == "openai" {
+        Provider::OpenAI
+    } else {
+        Provider::Anthropic
+    }
+}
+
+fn msg_line(marker: char, m: &diff::Msg, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {marker} "), Style::new().fg(color).bold()),
+        Span::styled(format!("{:<10}", m.role), Style::new().fg(color)),
+        Span::styled(format!("{:<16}", m.kind), Style::new().fg(DIM)),
+        Span::styled(
+            format!("{:>8}  ", format!("{} ch", fmt_tokens(m.chars as i64))),
+            Style::new().fg(DIM),
+        ),
+        Span::styled(m.preview.clone(), Style::new().fg(Color::Rgb(150, 156, 170))),
+    ])
+}
+
+fn stat_line(label: &str, spans: Vec<Span<'static>>) -> Line<'static> {
+    let mut all = vec![Span::styled(
+        format!(" {label:<9}"),
+        Style::new().fg(DIM).bold(),
+    )];
+    all.extend(spans);
+    Line::from(all)
+}
+
+fn build_diff_screen(p: &DiffPayload) -> DiffScreen {
+    const GREEN: Color = Color::Rgb(74, 222, 128);
+    const RED: Color = Color::Rgb(248, 113, 113);
+    const YELLOW: Color = Color::Rgb(250, 204, 21);
+
+    let title = match &p.prev {
+        Some(prev) => format!("#{} ⇐ #{} · {}", p.curr.id, prev.id, p.curr.model),
+        None => format!("#{} · {}", p.curr.id, p.curr.model),
+    };
+    let mut lines: Vec<Line<'static>> = vec![Line::default()];
+
+    let Some(curr) = diff::parse_convo(provider_of(&p.curr), &p.curr_body) else {
+        lines.push(Line::from(Span::styled(
+            " this request has no conversation payload to diff",
+            Style::new().fg(DIM),
+        )));
+        return DiffScreen { title, lines, scroll: 0 };
+    };
+    let prev_convo = p
+        .prev_body
+        .as_deref()
+        .and_then(|b| diff::parse_convo(provider_of(&p.curr), b));
+
+    let changed = |is_changed: bool| -> Span<'static> {
+        if is_changed {
+            Span::styled("CHANGED", Style::new().fg(YELLOW).bold())
+        } else {
+            Span::styled("unchanged", Style::new().fg(DIM))
+        }
+    };
+
+    match prev_convo {
+        None => {
+            lines.push(Line::from(Span::styled(
+                " first captured request of this kind — showing composition",
+                Style::new().fg(YELLOW),
+            )));
+            lines.push(Line::default());
+            lines.push(stat_line(
+                "system",
+                vec![Span::raw(format!("{} chars", fmt_tokens(curr.system_chars as i64)))],
+            ));
+            lines.push(stat_line(
+                "tools",
+                vec![Span::raw(format!(
+                    "{} tools · {} chars",
+                    curr.tools_count,
+                    fmt_tokens(curr.tools_chars as i64)
+                ))],
+            ));
+            lines.push(stat_line(
+                "messages",
+                vec![Span::raw(format!("{}", curr.messages.len()))],
+            ));
+            lines.push(Line::default());
+            for m in &curr.messages {
+                lines.push(msg_line(' ', m, Color::Rgb(150, 156, 170)));
+            }
+        }
+        Some(prevc) => {
+            let d = diff::diff(&prevc, &curr);
+
+            lines.push(stat_line(
+                "system",
+                vec![
+                    Span::raw(format!("{} chars · ", fmt_tokens(curr.system_chars as i64))),
+                    changed(d.system_changed),
+                ],
+            ));
+            lines.push(stat_line(
+                "tools",
+                vec![
+                    Span::raw(format!(
+                        "{} tools · {} chars · ",
+                        curr.tools_count,
+                        fmt_tokens(curr.tools_chars as i64)
+                    )),
+                    changed(d.tools_changed),
+                ],
+            ));
+            lines.push(stat_line(
+                "messages",
+                vec![
+                    Span::raw(format!("{} kept · ", d.kept)),
+                    Span::styled(
+                        format!("{} appended", d.appended.len()),
+                        Style::new().fg(GREEN),
+                    ),
+                    Span::raw(" · "),
+                    Span::styled(
+                        format!("{} dropped", d.dropped.len()),
+                        Style::new().fg(if d.dropped.is_empty() { DIM } else { RED }),
+                    ),
+                ],
+            ));
+
+            // The economics line: what the agent re-sent vs. what the
+            // provider says it served from cache.
+            let resent_chars = curr.system_chars + curr.tools_chars + d.kept_chars;
+            let est_resent_tok = (resent_chars / 4) as i64;
+            let reported = p.curr.cache_read_tokens;
+            if est_resent_tok > 0 {
+                let ratio = reported as f64 / est_resent_tok as f64;
+                let verdict = if reported == 0 && est_resent_tok > 1_000 {
+                    Span::styled(
+                        "✗ no cache reads — full re-send billed",
+                        Style::new().fg(RED).bold(),
+                    )
+                } else if ratio >= 0.7 {
+                    Span::styled("✓ cache effective", Style::new().fg(GREEN))
+                } else {
+                    Span::styled("⚠ partial cache", Style::new().fg(YELLOW))
+                };
+                lines.push(stat_line(
+                    "context",
+                    vec![
+                        Span::raw(format!(
+                            "≈{} tok re-sent · API reports {} from cache · ",
+                            fmt_tokens(est_resent_tok),
+                            fmt_tokens(reported)
+                        )),
+                        verdict,
+                    ],
+                ));
+            }
+
+            lines.push(Line::default());
+            if d.kept > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        " = {} messages kept · {} chars",
+                        d.kept,
+                        fmt_tokens(d.kept_chars as i64)
+                    ),
+                    Style::new().fg(DIM),
+                )));
+            }
+            for m in &d.dropped {
+                lines.push(msg_line('-', m, RED));
+            }
+            for m in &d.appended {
+                lines.push(msg_line('+', m, GREEN));
+            }
+        }
+    }
+
+    DiffScreen { title, lines, scroll: 0 }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -425,15 +729,14 @@ fn draw_ttft(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_table(f: &mut Frame, app: &App, area: Rect) {
+fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let header = Row::new(
         ["TIME", "MODEL", "IN", "CACHE", "OUT", "TTFT", "TOTAL", "COST"]
             .into_iter()
             .map(|h| Cell::from(h).style(Style::new().fg(DIM).add_modifier(Modifier::BOLD))),
     );
 
-    let visible = area.height.saturating_sub(3) as usize;
-    let rows = app.records.iter().take(visible).enumerate().map(|(i, r)| {
+    let rows = app.records.iter().take(1000).enumerate().map(|(i, r)| {
         let time = Local
             .timestamp_millis_opt(r.ts_ms)
             .single()
@@ -490,8 +793,16 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
         ],
     )
     .header(header)
+    .row_highlight_style(Style::new().bg(Color::Rgb(44, 50, 66)))
     .block(panel(vec![Span::styled(" requests ", Style::new().bold())]));
-    f.render_widget(table, area);
+
+    if app.records.is_empty() {
+        app.table.select(None);
+    } else {
+        app.selected = app.selected.min(app.records.len() - 1);
+        app.table.select(Some(app.selected));
+    }
+    f.render_stateful_widget(table, area, &mut app.table);
 }
 
 fn fmt_tokens(n: i64) -> String {
@@ -524,10 +835,10 @@ fn fmt_cost(c: f64) -> String {
     }
 }
 
-/// Render one frame of the dashboard with synthetic traffic into styled HTML.
+/// Render one frame of the TUI with synthetic traffic into styled HTML.
 /// Powers the hidden `debug-render` subcommand used for screenshots.
-pub fn render_demo_html(width: u16, height: u16) -> Result<String> {
-    use crate::protocol::{Provider, Usage};
+pub fn render_demo_html(width: u16, height: u16, view: &str) -> Result<String> {
+    use crate::protocol::Usage;
     use crate::record::cost_usd;
 
     let now_ms = SystemTime::now()
@@ -601,17 +912,109 @@ pub fn render_demo_html(width: u16, height: u16) -> Result<String> {
         });
     }
 
-    let app = App {
+    let mut app = App {
         port: 4040,
         records,
         last_id: 30,
         connected: true,
+        selected: 0,
+        table: TableState::default(),
+        view: View::Dashboard,
     };
+    if view == "diff" {
+        app.view = View::Diff(build_diff_screen(&demo_diff_payload(now_ms)));
+    }
 
     let backend = ratatui::backend::TestBackend::new(width, height);
     let mut term = ratatui::Terminal::new(backend)?;
-    term.draw(|f| draw(f, &app))?;
+    term.draw(|f| draw(f, &mut app))?;
     Ok(buffer_to_html(term.backend().buffer()))
+}
+
+/// Synthetic agent turn for the diff-view screenshot: prev has six messages,
+/// curr appends an assistant tool call and its result.
+fn demo_diff_payload(now_ms: i64) -> DiffPayload {
+    use serde_json::json;
+
+    let system = "You are an agentic coding assistant working in a Rust repository. ".repeat(230);
+    let tools: Vec<_> = (0..24)
+        .map(|i| {
+            json!({
+                "name": format!("tool_{i}"),
+                "description": "Executes project operations with structured input. ".repeat(12),
+                "input_schema": {"type": "object"}
+            })
+        })
+        .collect();
+
+    let mut messages = vec![json!({
+        "role": "user",
+        "content": "Fix the failing widget tests in llmscope and make the graph smoother"
+    })];
+    for i in 0..4 {
+        messages.push(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": format!("Running the test suite to inspect failure {i}…")},
+                {"type": "tool_use", "id": format!("t{i}"), "name": "bash",
+                 "input": {"cmd": "cargo test"}}
+            ]
+        }));
+        messages.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result", "tool_use_id": format!("t{i}"),
+                "content": "error[E0063]: missing field `baseline` in initializer of `AreaGraph` — src/tui.rs:590. ".repeat(60)
+            }]
+        }));
+    }
+    let prev_body = json!({
+        "model": "claude-sonnet-4-5", "system": system, "tools": tools, "messages": messages
+    })
+    .to_string();
+
+    messages.push(json!({
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": "The widget tests construct AreaGraph without the new baseline field. Patching both test sites."},
+            {"type": "tool_use", "id": "t9", "name": "edit", "input": {"file": "src/tui.rs"}}
+        ]
+    }));
+    messages.push(json!({
+        "role": "user",
+        "content": [{
+            "type": "tool_result", "tool_use_id": "t9",
+            "content": "test result: ok. 4 passed; 0 failed; 0 ignored — ".repeat(25)
+        }]
+    }));
+    let curr_body = json!({
+        "model": "claude-sonnet-4-5", "system": system, "tools": tools, "messages": messages
+    })
+    .to_string();
+
+    let rec = |id: i64, cache_read: i64| RequestRecord {
+        id,
+        ts_ms: now_ms - (48 - id) * 11_000,
+        provider: "anthropic".to_string(),
+        model: "claude-sonnet-4-5".to_string(),
+        path: "/v1/messages".to_string(),
+        status: 200,
+        input_tokens: 850,
+        output_tokens: 1_400,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: 420,
+        ttft_ms: 480,
+        duration_ms: 9_200,
+        cost_usd: 0.048,
+        streamed: true,
+        estimated: false,
+    };
+    DiffPayload {
+        curr: rec(47, 12_600),
+        curr_body,
+        prev: Some(rec(46, 11_900)),
+        prev_body: Some(prev_body),
+    }
 }
 
 fn buffer_to_html(buf: &Buffer) -> String {

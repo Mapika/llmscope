@@ -38,7 +38,10 @@ parses the SSE stream on the side, and records:
 - **full bodies** — every request and response, in a local SQLite file
 
 `llmscope top` attaches to the proxy from another terminal and renders the
-live view.
+live view. Select any request with `↑↓` and hit `⏎` for the **turn diff**:
+what your agent kept, appended, or dropped versus its previous request —
+and whether the re-sent context was actually served from cache or billed
+in full.
 
 ## Local models too
 
@@ -57,9 +60,10 @@ are never stored — only request/response bodies and timing metadata.
 
 ## Status
 
-Early. Core proxy + TUI work. Planned next:
+Early. Core proxy + TUI + turn diff work. Planned next:
 
-- [ ] **turn diff** — see exactly what your agent re-sends every turn
+- [x] **turn diff** — see exactly what your agent re-sends every turn
+- [ ] denser dashboard: per-model spend meters, context-growth graph
 - [ ] cache-miss cost analysis ("this session wasted $X on cache misses")
 - [ ] request detail / body viewer in the TUI
 - [ ] web UI for deep inspection

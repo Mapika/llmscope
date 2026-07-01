@@ -1,3 +1,4 @@
+mod diff;
 mod protocol;
 mod proxy;
 mod record;
@@ -68,6 +69,9 @@ enum Cmd {
         width: u16,
         #[arg(long, default_value_t = 38)]
         height: u16,
+        /// Which screen to render: dashboard | diff
+        #[arg(long, default_value = "dashboard")]
+        view: String,
         #[arg(long)]
         out: PathBuf,
     },
@@ -100,8 +104,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Top { port } => tui::run(port).await,
-        Cmd::DebugRender { width, height, out } => {
-            std::fs::write(&out, tui::render_demo_html(width, height)?)?;
+        Cmd::DebugRender {
+            width,
+            height,
+            view,
+            out,
+        } => {
+            std::fs::write(&out, tui::render_demo_html(width, height, &view)?)?;
             eprintln!("wrote {}", out.display());
             Ok(())
         }
