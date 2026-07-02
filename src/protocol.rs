@@ -13,6 +13,14 @@ impl Provider {
             Provider::OpenAI => "openai",
         }
     }
+
+    pub fn from_name(name: &str) -> Provider {
+        if name == "openai" {
+            Provider::OpenAI
+        } else {
+            Provider::Anthropic
+        }
+    }
 }
 
 pub struct ReqInfo {

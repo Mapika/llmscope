@@ -1,4 +1,5 @@
 mod diff;
+mod otlp;
 mod prices;
 mod protocol;
 mod proxy;
@@ -40,6 +41,10 @@ struct ProxyArgs {
     /// SQLite capture file (default: per-user data dir)
     #[arg(long)]
     db: Option<PathBuf>,
+    /// Also export each request as an OTLP/HTTP JSON span, e.g.
+    /// http://127.0.0.1:4318 (an OpenTelemetry collector)
+    #[arg(long)]
+    otlp_endpoint: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -63,6 +68,17 @@ enum Cmd {
         #[arg(long, default_value_t = 4040)]
         port: u16,
     },
+    /// Re-send a captured request through the running proxy. The replay is
+    /// captured like any other request. Credentials come from the
+    /// environment (ANTHROPIC_API_KEY / OPENAI_API_KEY) — captures never
+    /// store them.
+    Replay {
+        /// Request id, as shown in `top` and the web UI
+        id: i64,
+        /// Port of the running proxy
+        #[arg(long, default_value_t = 4040)]
+        port: u16,
+    },
     /// Render a demo TUI frame to HTML (for screenshots)
     #[command(hide = true)]
     DebugRender {
@@ -80,12 +96,16 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Pricing overrides live next to the default capture db; both the proxy
+    // (costing) and top (cache economics) need them.
+    record::load_user_prices(&store::default_db_path().with_file_name("prices.toml"));
     match Cli::parse().cmd {
         Cmd::Run { proxy, command } => {
             let port = proxy.port;
             start_proxy(proxy).await?;
             eprintln!(
-                "llmscope: proxy on http://127.0.0.1:{port} — run `llmscope top` in another terminal"
+                "llmscope: proxy on http://127.0.0.1:{port} — run `llmscope top` in another \
+                 terminal, or open http://127.0.0.1:{port}/_llmscope/ui"
             );
             let code = run_child(port, &command).await?;
             std::process::exit(code);
@@ -100,11 +120,13 @@ async fn main() -> Result<()> {
             eprintln!("  bash/zsh:");
             eprintln!("    export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}/anthropic");
             eprintln!("    export OPENAI_BASE_URL=http://127.0.0.1:{port}/openai/v1");
-            eprintln!("\nrun `llmscope top` in another terminal. Ctrl+C to stop.");
+            eprintln!("\nrun `llmscope top` in another terminal, or open");
+            eprintln!("http://127.0.0.1:{port}/_llmscope/ui — Ctrl+C to stop.");
             tokio::signal::ctrl_c().await?;
             Ok(())
         }
         Cmd::Top { port } => tui::run(port).await,
+        Cmd::Replay { id, port } => replay(port, id).await,
         Cmd::DebugRender {
             width,
             height,
@@ -124,6 +146,7 @@ async fn start_proxy(args: ProxyArgs) -> Result<()> {
     let state = Arc::new(proxy::AppState::new(
         args.anthropic_upstream,
         args.openai_upstream,
+        args.otlp_endpoint,
         store,
     ));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", args.port))
@@ -140,6 +163,53 @@ async fn start_proxy(args: ProxyArgs) -> Result<()> {
             eprintln!("llmscope: proxy stopped: {e}");
         }
     });
+    Ok(())
+}
+
+async fn replay(port: u16, id: i64) -> Result<()> {
+    use std::io::Write;
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let resp = client
+        .get(format!("{base}/_llmscope/diff/{id}"))
+        .send()
+        .await
+        .with_context(|| format!("no proxy on :{port} — start `llmscope serve` first"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        bail!("no captured request with id {id}");
+    }
+    let payload: proxy::DiffPayload = resp.error_for_status()?.json().await?;
+
+    let url = format!("{base}/{}{}", payload.curr.provider, payload.curr.path);
+    let mut req = client.post(&url).header("content-type", "application/json");
+    req = if payload.curr.provider == "anthropic" {
+        let key = std::env::var("ANTHROPIC_API_KEY")
+            .context("set ANTHROPIC_API_KEY to replay an Anthropic request")?;
+        req.header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        let key = std::env::var("OPENAI_API_KEY")
+            .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+            .context("set OPENAI_API_KEY (or OPENROUTER_API_KEY) to replay this request")?;
+        req.header("authorization", format!("Bearer {key}"))
+    };
+
+    eprintln!(
+        "llmscope: replaying #{id} · {} · {}{}",
+        payload.curr.model, payload.curr.provider, payload.curr.path
+    );
+    let mut resp = req.body(payload.curr_body).send().await?;
+    let status = resp.status();
+    eprintln!("llmscope: upstream says {status}");
+    let mut out = std::io::stdout().lock();
+    while let Some(chunk) = resp.chunk().await? {
+        out.write_all(&chunk)?;
+    }
+    out.flush()?;
+    if !status.is_success() {
+        bail!("upstream returned {status}");
+    }
     Ok(())
 }
 

@@ -1,3 +1,6 @@
+use std::path::Path;
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::Usage;
@@ -45,12 +48,88 @@ pub struct ModelPrice {
     pub cache_write: f64,
 }
 
-pub fn price(model: &str) -> Option<&'static ModelPrice> {
+/// $/Mtok rates resolved for one model.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rates {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+/// User overrides from `prices.toml`, longest prefix first. Set once at
+/// startup; empty when the file is absent.
+static USER_PRICES: OnceLock<Vec<(String, Rates)>> = OnceLock::new();
+
+/// Load pricing overrides. Entries beat the built-in table, so users can
+/// price local models, gateways with custom slugs, or negotiated rates:
+///
+/// ```toml
+/// [[model]]
+/// prefix = "qwen3"
+/// input = 0.0          # $/Mtok
+/// output = 0.0
+/// cache_read = 0.0     # optional, defaults to `input`
+/// cache_write = 0.0    # optional, defaults to `input`
+/// ```
+pub fn load_user_prices(path: &Path) {
+    #[derive(Deserialize)]
+    struct File {
+        #[serde(default)]
+        model: Vec<Entry>,
+    }
+    #[derive(Deserialize)]
+    struct Entry {
+        prefix: String,
+        input: f64,
+        output: f64,
+        cache_read: Option<f64>,
+        cache_write: Option<f64>,
+    }
+
+    let mut entries: Vec<(String, Rates)> = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        match toml::from_str::<File>(&text) {
+            Ok(f) => {
+                entries = f
+                    .model
+                    .into_iter()
+                    .map(|e| {
+                        let rates = Rates {
+                            input: e.input,
+                            output: e.output,
+                            cache_read: e.cache_read.unwrap_or(e.input),
+                            cache_write: e.cache_write.unwrap_or(e.input),
+                        };
+                        (e.prefix, rates)
+                    })
+                    .collect();
+                entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.0.cmp(&b.0)));
+            }
+            Err(e) => eprintln!("llmscope: ignoring {}: {e}", path.display()),
+        }
+    }
+    let _ = USER_PRICES.set(entries);
+}
+
+pub fn price(model: &str) -> Option<Rates> {
     // Gateways like OpenRouter vendor-prefix model names ("openai/gpt-4o-mini").
     let bare = model.rsplit('/').next().unwrap_or(model);
+    let hit = |prefix: &str| model.starts_with(prefix) || bare.starts_with(prefix);
+    if let Some(user) = USER_PRICES.get()
+        && let Some((_, rates)) = user.iter().find(|(p, _)| hit(p))
+    {
+        return Some(*rates);
+    }
     crate::prices::PRICES
         .iter()
-        .find(|p| model.starts_with(p.prefix) || bare.starts_with(p.prefix))
+        .find(|p| hit(p.prefix))
+        .map(|p| Rates {
+            input: p.input,
+            output: p.output,
+            cache_read: p.cache_read,
+            cache_write: p.cache_write,
+        })
 }
 
 /// Dollars saved by cache reads (vs paying full input price), and dollars
@@ -120,10 +199,31 @@ mod tests {
 
     #[test]
     fn gateway_slugs_price_like_first_party() {
-        assert_eq!(
-            price("anthropic/claude-sonnet-5").unwrap().prefix,
-            price("claude-sonnet-5").unwrap().prefix,
-        );
+        assert_eq!(price("anthropic/claude-sonnet-5"), price("claude-sonnet-5"));
+        assert!(price("claude-sonnet-5").is_some());
+    }
+
+    #[test]
+    fn user_overrides_beat_the_builtin_table() {
+        // Uses a prefix disjoint from the built-ins: USER_PRICES is a
+        // process-wide OnceLock shared with the other tests.
+        let path = std::env::temp_dir().join(format!(
+            "llmscope-prices-test-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "[[model]]\nprefix = \"my-local-llama\"\ninput = 0.5\noutput = 2.0\n",
+        )
+        .unwrap();
+        load_user_prices(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let r = price("my-local-llama-70b").unwrap();
+        assert_eq!(r.input, 0.5);
+        assert_eq!(r.output, 2.0);
+        assert_eq!(r.cache_read, 0.5, "cache_read defaults to input");
+        assert!(price("claude-sonnet-5").is_some(), "built-ins still resolve");
     }
 
     #[test]

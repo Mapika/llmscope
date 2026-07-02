@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>llmscope</title>
+<style>
+  :root {
+    --bg: #0b0d12; --panel: #10131a; --border: #373c4b; --zebra: #14161c;
+    --text: #c8ccd4; --dim: #5a6070; --accent: #22d3ee;
+    --green: #4ade80; --red: #f87171; --yellow: #facc15;
+    --anthropic: #d97757; --openai: #10a37f;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--mono); font-size: 13px; }
+  header {
+    display: flex; align-items: center; gap: 18px; padding: 10px 16px;
+    border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg); z-index: 2;
+  }
+  header .logo { color: var(--accent); font-weight: 700; }
+  header .dot { font-size: 10px; }
+  header .stat b { color: var(--text); } header .stat { color: var(--dim); }
+  main { display: grid; grid-template-columns: minmax(560px, 58%) 1fr; height: calc(100vh - 41px); }
+  #list { overflow-y: auto; border-right: 1px solid var(--border); }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; color: var(--dim); font-weight: 700; padding: 6px 8px; position: sticky; top: 0; background: var(--bg); }
+  td { padding: 4px 8px; white-space: nowrap; }
+  tbody tr:nth-child(even) { background: var(--zebra); }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: #1a1e28; }
+  tbody tr.sel { background: #2c3242; }
+  td.num { text-align: right; }
+  .cost { color: var(--green); }
+  .dim { color: var(--dim); }
+  #detail { overflow-y: auto; padding: 14px 18px; }
+  #detail .empty { color: var(--dim); margin-top: 40vh; text-align: center; }
+  .h { color: var(--accent); font-weight: 700; margin: 0 0 10px; }
+  .stat-line { display: flex; gap: 8px; margin: 2px 0; }
+  .stat-line .k { color: var(--dim); font-weight: 700; min-width: 76px; }
+  .verdict-miss { color: var(--red); font-weight: 700; }
+  .verdict-partial { color: var(--yellow); }
+  .verdict-ok { color: var(--green); }
+  .why { color: var(--yellow); }
+  .snippet { margin-left: 84px; }
+  .snippet .k { color: var(--dim); }
+  .msgs { margin: 12px 0; }
+  .msg { display: flex; gap: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .msg .marker { width: 12px; font-weight: 700; }
+  .msg .role { min-width: 80px; }
+  .msg .kind, .msg .chars { color: var(--dim); min-width: 110px; }
+  .msg .preview { color: #969caa; overflow: hidden; text-overflow: ellipsis; }
+  .add { color: var(--green); } .del { color: var(--red); } .keep { color: var(--dim); }
+  details { margin: 10px 0; border: 1px solid var(--border); border-radius: 6px; }
+  summary { cursor: pointer; padding: 6px 10px; color: var(--accent); }
+  details pre {
+    margin: 0; padding: 10px; max-height: 46vh; overflow: auto;
+    font-size: 12px; color: #969caa; border-top: 1px solid var(--border); white-space: pre-wrap; word-break: break-all;
+  }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } #detail { display: none; } main.showing #detail { display: block; } main.showing #list { display: none; } }
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">llmscope</span>
+  <span class="dot" id="dot" style="color:var(--red)">●</span>
+  <span class="stat">req <b id="s-req">0</b></span>
+  <span class="stat">in <b id="s-in">0</b></span>
+  <span class="stat">out <b id="s-out">0</b></span>
+  <span class="stat">spend <b id="s-spend" style="color:var(--green)">$0.00</b></span>
+  <span class="stat">cache <b id="s-cache">0%</b></span>
+</header>
+<main id="main">
+  <div id="list">
+    <table>
+      <thead><tr>
+        <th>TIME</th><th>SESS</th><th>MODEL</th><th class="num">IN</th><th class="num">CACHE</th>
+        <th class="num">OUT</th><th class="num">TTFT</th><th class="num">TOTAL</th><th class="num">COST</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <div id="detail"><div class="empty">select a request — the turn diff and bodies show here</div></div>
+</main>
+<script>
+"use strict";
+const SESSION_COLORS = ["#22d3ee","#a78bfa","#34d399","#fbbf24","#f472b6","#38bdf8"];
+let records = [];        // newest first
+let lastId = 0;
+let selected = null;
+const labels = new Map(); // session -> {tag, color}
+
+const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const fmtTok = n => n >= 1e6 ? (n/1e6).toFixed(2)+"M" : n >= 1e3 ? (n/1e3).toFixed(1)+"k" : String(n);
+const fmtMs = ms => ms < 0 ? "-" : ms < 1000 ? ms+"ms" : (ms/1000).toFixed(1)+"s";
+const fmtCost = c => c === 0 ? "-" : c < 0.01 ? "$"+c.toFixed(4) : "$"+c.toFixed(2);
+const fmtTime = ts => new Date(ts).toTimeString().slice(0, 8);
+const provColor = p => p === "anthropic" ? "var(--anthropic)" : p === "openai" ? "var(--openai)" : "var(--accent)";
+const totalIn = r => r.input_tokens + r.cache_read_tokens + r.cache_write_tokens;
+
+function label(session) {
+  if (!session) return { tag: "—", color: "var(--dim)" };
+  if (!labels.has(session))
+    labels.set(session, { tag: "s" + (labels.size + 1), color: SESSION_COLORS[labels.size % SESSION_COLORS.length] });
+  return labels.get(session);
+}
+
+function renderStats() {
+  let inp = 0, out = 0, read = 0, spend = 0;
+  for (const r of records) { inp += totalIn(r); out += r.output_tokens; read += r.cache_read_tokens; spend += r.cost_usd; }
+  document.getElementById("s-req").textContent = records.length;
+  document.getElementById("s-in").textContent = fmtTok(inp);
+  document.getElementById("s-out").textContent = fmtTok(out);
+  document.getElementById("s-spend").textContent = "$" + spend.toFixed(2);
+  document.getElementById("s-cache").textContent = inp > 0 ? Math.round(100 * read / inp) + "%" : "0%";
+}
+
+function renderTable() {
+  const body = document.getElementById("rows");
+  body.innerHTML = records.map(r => {
+    const l = label(r.session);
+    const tin = totalIn(r);
+    const cache = tin > 0 ? Math.round(100 * r.cache_read_tokens / tin) + "%" : "-";
+    const err = r.status >= 400 || r.status === 0;
+    const approx = r.estimated ? "~" : "";
+    return `<tr data-id="${r.id}" class="${r.id === selected ? "sel" : ""}">
+      <td class="dim">${fmtTime(r.ts_ms)}</td>
+      <td style="color:${l.color};font-weight:700">▍${l.tag}</td>
+      <td style="color:${err ? "var(--red)" : provColor(r.provider)}">${esc(r.model)}${err ? ` [${r.status}]` : ""}</td>
+      <td class="num">${approx}${fmtTok(tin)}</td>
+      <td class="num">${cache}</td>
+      <td class="num">${approx}${fmtTok(r.output_tokens)}</td>
+      <td class="num dim">${fmtMs(r.ttft_ms)}</td>
+      <td class="num dim">${fmtMs(r.duration_ms)}</td>
+      <td class="num cost">${fmtCost(r.cost_usd)}</td>
+    </tr>`;
+  }).join("");
+  body.querySelectorAll("tr").forEach(tr => tr.onclick = () => select(+tr.dataset.id));
+}
+
+function statLine(k, html) { return `<div class="stat-line"><span class="k">${k}</span><span>${html}</span></div>`; }
+
+function causeHtml(c) {
+  const name = typeof c === "string" ? c : Object.keys(c)[0];
+  const v = typeof c === "string" ? {} : c[name];
+  switch (name) {
+    case "NoCacheControl":
+      return statLine("why", `<span class="why">no cache_control breakpoints in the request — explicit caching is off</span>`);
+    case "SystemChanged":
+      return statLine("why", `<span class="why">system prompt changed at char ${v.at_char}</span>`)
+        + `<div class="snippet"><span class="k">prev </span><span class="del">${esc(v.prev_snippet)}</span></div>`
+        + `<div class="snippet"><span class="k">curr </span><span class="add">${esc(v.curr_snippet)}</span></div>`;
+    case "ToolsChanged":
+      return statLine("why", `<span class="why">tool definitions changed — ${esc(v.detail)}</span>`);
+    case "HistoryRewritten":
+      return statLine("why", `<span class="why">history rewritten at message ${v.at_msg} — cacheable prefix broken (compaction?)</span>`);
+    case "TtlExpired": {
+      const gap = v.gap_secs >= 60 ? Math.round(v.gap_secs / 60) + "m" : v.gap_secs + "s";
+      return statLine("why", `<span class="why">prefix unchanged, but the previous turn was ${gap} ago — cache TTL (~5 min) expired</span>`);
+    }
+    default: return "";
+  }
+}
+
+async function select(id) {
+  selected = id;
+  document.getElementById("main").classList.add("showing");
+  renderTable();
+  const detail = document.getElementById("detail");
+  detail.innerHTML = `<div class="empty">loading #${id}…</div>`;
+  try {
+    const [a, d] = await Promise.all([
+      fetch(`/_llmscope/analysis/${id}`).then(r => r.json()),
+      fetch(`/_llmscope/diff/${id}`).then(r => r.json()),
+    ]);
+    const changed = c => c ? `<span class="why">CHANGED</span>` : `<span class="dim">unchanged</span>`;
+    const verdict = {
+      miss: `<span class="verdict-miss">✗ no cache reads — full re-send billed</span>`,
+      partial: `<span class="verdict-partial">⚠ partial cache</span>`,
+      ok: `<span class="verdict-ok">✓ cache effective</span>`,
+      first: `<span class="verdict-partial">first captured request of this kind</span>`,
+      none: `<span class="dim">no conversation payload</span>`,
+    }[a.verdict];
+    let html = `<p class="h">#${a.curr.id}${a.prev ? " ⇐ #" + a.prev.id : ""} · ${esc(a.curr.model)} · ${fmtCost(a.curr.cost_usd)}</p>`;
+    html += statLine("system", `${fmtTok(a.system_chars)} chars · ${changed(a.system_changed)}`);
+    html += statLine("tools", `${a.tools_count} tools · ${fmtTok(a.tools_chars)} chars · ${changed(a.tools_changed)}`);
+    const plus = a.messages.filter(m => m.change === "+").length;
+    const minus = a.messages.filter(m => m.change === "-").length;
+    html += statLine("messages", `${a.kept} kept · <span class="add">${plus} appended</span> · <span class="${minus ? "del" : "dim"}">${minus} dropped</span>`);
+    if (a.est_resent_tok > 0)
+      html += statLine("context", `≈${fmtTok(a.est_resent_tok)} tok re-sent · API reports ${fmtTok(a.curr.cache_read_tokens)} from cache · ${verdict}`);
+    else
+      html += statLine("verdict", verdict);
+    html += a.causes.map(causeHtml).join("");
+    html += `<div class="msgs">` + a.messages.map(m => {
+      const cls = m.change === "+" ? "add" : m.change === "-" ? "del" : "keep";
+      return `<div class="msg"><span class="marker ${cls}">${m.change === "=" ? "" : m.change}</span>
+        <span class="role ${cls}">${esc(m.role)}</span><span class="kind">${esc(m.kind)}</span>
+        <span class="chars">${fmtTok(m.chars)} ch</span><span class="preview">${esc(m.preview)}</span></div>`;
+    }).join("") + `</div>`;
+    const pretty = b => { try { return JSON.stringify(JSON.parse(b), null, 2); } catch { return b; } };
+    const cap = s => s.length > 500_000 ? s.slice(0, 500_000) + "\n… truncated" : s;
+    html += `<details><summary>request body</summary><pre>${esc(cap(pretty(d.curr_body)))}</pre></details>`;
+    html += `<details><summary>response body</summary><pre>${esc(cap(d.curr_response_body || "(empty)"))}</pre></details>`;
+    detail.innerHTML = html;
+  } catch (e) {
+    detail.innerHTML = `<div class="empty">could not load #${id}: ${esc(String(e))}</div>`;
+  }
+}
+
+async function poll() {
+  try {
+    const fresh = await fetch(`/_llmscope/requests?since=${lastId}&limit=2000`).then(r => r.json());
+    document.getElementById("dot").style.color = "var(--green)";
+    if (fresh.length) {
+      // Ascending from the API; oldest-first label assignment, newest-first list.
+      for (const r of fresh) { label(r.session); lastId = Math.max(lastId, r.id); }
+      records = fresh.reverse().concat(records).slice(0, 5000);
+      renderTable();
+      renderStats();
+    }
+  } catch {
+    document.getElementById("dot").style.color = "var(--red)";
+  }
+  setTimeout(poll, 1000);
+}
+poll();
+</script>
+</body>
+</html>

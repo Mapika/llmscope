@@ -5,7 +5,7 @@ use crate::protocol::Provider;
 /// One conversation message, reduced to what the diff needs. `fp` is a
 /// fingerprint of the full serialized message, so any rewrite — even a
 /// one-character edit deep in a tool result — breaks prefix matching.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Msg {
     pub role: String,
     pub kind: String,
@@ -201,7 +201,7 @@ pub fn parse_convo(_provider: Provider, body: &str) -> Option<Convo> {
 
 /// Why a follow-up turn missed (or partially missed) the prompt cache.
 /// Ordered root-cause-first; multiple causes can apply to one turn.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize)]
 pub enum MissCause {
     /// The request sets no `cache_control` breakpoints at all, so explicit
     /// (Anthropic) caching was never enabled.

@@ -411,11 +411,7 @@ fn draw_diff(f: &mut Frame, screen: &DiffScreen) {
 }
 
 fn provider_of(r: &RequestRecord) -> Provider {
-    if r.provider == "openai" {
-        Provider::OpenAI
-    } else {
-        Provider::Anthropic
-    }
+    Provider::from_name(&r.provider)
 }
 
 fn msg_line(marker: char, m: &diff::Msg, color: Color) -> Line<'static> {

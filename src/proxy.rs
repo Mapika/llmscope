@@ -10,6 +10,7 @@ use axum::Router;
 use futures::StreamExt;
 use serde::Deserialize;
 
+use crate::diff;
 use crate::protocol::{self, Provider};
 use crate::record::{self, RequestRecord};
 use crate::store::Store;
@@ -18,11 +19,17 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub anthropic_upstream: String,
     pub openai_upstream: String,
+    pub otlp_endpoint: Option<String>,
     pub store: Arc<Store>,
 }
 
 impl AppState {
-    pub fn new(anthropic_upstream: String, openai_upstream: String, store: Arc<Store>) -> Self {
+    pub fn new(
+        anthropic_upstream: String,
+        openai_upstream: String,
+        otlp_endpoint: Option<String>,
+        store: Arc<Store>,
+    ) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(30))
@@ -30,6 +37,7 @@ impl AppState {
                 .expect("reqwest client"),
             anthropic_upstream: anthropic_upstream.trim_end_matches('/').to_string(),
             openai_upstream: openai_upstream.trim_end_matches('/').to_string(),
+            otlp_endpoint: otlp_endpoint.map(|e| e.trim_end_matches('/').to_string()),
             store,
         }
     }
@@ -39,6 +47,15 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/_llmscope/requests", get(list_requests))
         .route("/_llmscope/diff/{id}", get(get_diff))
+        .route("/_llmscope/analysis/{id}", get(get_analysis))
+        .route(
+            "/_llmscope/ui",
+            get(|| async { axum::response::Html(include_str!("ui.html")) }),
+        )
+        .route(
+            "/",
+            get(|| async { axum::response::Redirect::temporary("/_llmscope/ui") }),
+        )
         .fallback(proxy_handler)
         .with_state(state)
 }
@@ -82,6 +99,135 @@ async fn get_diff(
         Ok(None) => (StatusCode::NOT_FOUND, "no such request").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+#[derive(serde::Serialize)]
+struct AnalysisMsg {
+    /// "=" kept · "-" dropped · "+" appended
+    change: &'static str,
+    #[serde(flatten)]
+    msg: diff::Msg,
+}
+
+/// The turn analysis the TUI's diff screen computes, as JSON — consumed by
+/// the web UI, and curl-able for scripting.
+#[derive(serde::Serialize)]
+struct Analysis {
+    curr: RequestRecord,
+    prev: Option<RequestRecord>,
+    system_chars: usize,
+    system_changed: bool,
+    tools_count: usize,
+    tools_chars: usize,
+    tools_changed: bool,
+    kept: usize,
+    est_resent_tok: i64,
+    /// "first" | "miss" | "partial" | "ok" | "none"
+    verdict: &'static str,
+    causes: Vec<diff::MissCause>,
+    messages: Vec<AnalysisMsg>,
+}
+
+async fn get_analysis(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Response {
+    let result = (|| -> anyhow::Result<Option<Analysis>> {
+        let Some((curr, curr_body, _)) = st.store.with_body(id, None)? else {
+            return Ok(None);
+        };
+        let prev = st.store.with_body(0, Some(&curr))?;
+        Ok(Some(analyze(curr, &curr_body, prev)))
+    })();
+    match result {
+        Ok(Some(a)) => Json(a).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such request").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+fn analyze(
+    curr: RequestRecord,
+    curr_body: &str,
+    prev: Option<(RequestRecord, String, String)>,
+) -> Analysis {
+    let provider = Provider::from_name(&curr.provider);
+    let curr_convo = diff::parse_convo(provider, curr_body);
+    let (prev_rec, prev_convo) = match prev {
+        Some((r, b, _)) => (Some(r), diff::parse_convo(provider, &b)),
+        None => (None, None),
+    };
+
+    let mut a = Analysis {
+        curr,
+        prev: prev_rec,
+        system_chars: 0,
+        system_changed: false,
+        tools_count: 0,
+        tools_chars: 0,
+        tools_changed: false,
+        kept: 0,
+        est_resent_tok: 0,
+        verdict: "none",
+        causes: Vec::new(),
+        messages: Vec::new(),
+    };
+    let Some(curr_convo) = curr_convo else {
+        return a; // no conversation payload (embeddings, etc.)
+    };
+    a.system_chars = curr_convo.system_chars;
+    a.tools_count = curr_convo.tools_count;
+    a.tools_chars = curr_convo.tools_chars;
+
+    let push = |list: &mut Vec<AnalysisMsg>, change, msgs: &[diff::Msg]| {
+        list.extend(msgs.iter().map(|m| AnalysisMsg {
+            change,
+            msg: m.clone(),
+        }));
+    };
+    match prev_convo {
+        None => {
+            a.verdict = "first";
+            push(&mut a.messages, "=", &curr_convo.messages);
+        }
+        Some(prevc) => {
+            let d = diff::diff(&prevc, &curr_convo);
+            a.system_changed = d.system_changed;
+            a.tools_changed = d.tools_changed;
+            a.kept = d.kept;
+            a.est_resent_tok =
+                ((curr_convo.system_chars + curr_convo.tools_chars + d.kept_chars) / 4) as i64;
+            let reported = a.curr.cache_read_tokens;
+            let ratio = if a.est_resent_tok > 0 {
+                reported as f64 / a.est_resent_tok as f64
+            } else {
+                0.0
+            };
+            // Same thresholds as the TUI's economics line.
+            let miss = reported == 0 && a.est_resent_tok > 1_000;
+            a.verdict = if miss {
+                "miss"
+            } else if ratio >= 0.7 {
+                "ok"
+            } else {
+                "partial"
+            };
+            if miss || (reported > 0 && ratio < 0.7) {
+                let gap_ms = a.prev.as_ref().map_or(0, |p| a.curr.ts_ms - p.ts_ms);
+                a.causes = diff::diagnose_miss(
+                    &prevc,
+                    &curr_convo,
+                    &d,
+                    provider == Provider::Anthropic,
+                    gap_ms,
+                );
+            }
+            push(&mut a.messages, "=", &curr_convo.messages[..d.kept]);
+            push(&mut a.messages, "-", &d.dropped);
+            push(&mut a.messages, "+", &d.appended);
+        }
+    }
+    a
 }
 
 #[derive(Deserialize)]
@@ -355,6 +501,26 @@ fn finalize(st: &AppState, ctx: FinishCtx, resp_body: Vec<u8>) {
         session: ctx.session,
     };
 
+    // OTLP export off the response path, fire-and-forget; failures are
+    // logged once, not per request.
+    if let Some(endpoint) = &st.otlp_endpoint
+        && let Ok(handle) = tokio::runtime::Handle::try_current()
+    {
+        let url = format!("{endpoint}/v1/traces");
+        let body = crate::otlp::span_json(&rec);
+        let client = st.client.clone();
+        handle.spawn(async move {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            let sent = client.post(&url).json(&body).send().await;
+            if let Err(e) = sent.and_then(|r| r.error_for_status())
+                && !WARNED.swap(true, Ordering::Relaxed)
+            {
+                eprintln!("llmscope: OTLP export to {url} failed (further errors muted): {e}");
+            }
+        });
+    }
+
     let store = Arc::clone(&st.store);
     let req_body = String::from_utf8_lossy(&ctx.req_body).into_owned();
     let resp_body = String::from_utf8_lossy(&resp_body).into_owned();
@@ -380,6 +546,7 @@ mod tests {
         let st = Arc::new(AppState::new(
             "http://unused".into(),
             "http://unused".into(),
+            None,
             Arc::clone(&store),
         ));
 

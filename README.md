@@ -28,11 +28,9 @@ is nothing to instrument. Responses stream through untouched — llmscope tees
 the bytes, parses the SSE stream on the side, and records:
 
 - **tokens** — input / output / cache reads / cache writes, per request
-- **cost** — priced per model with per-model cache read/write rates, from a
-  built-in table generated off [LiteLLM's community pricing data](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)
-  (`python scripts/update_prices.py` refreshes it); when a gateway reports
-  the exact cost — OpenRouter sends `usage.cost` on every response — that
-  number wins over the table
+- **cost** — priced per model with per-model cache read/write rates; exact
+  gateway-reported costs (OpenRouter) win over the table — see
+  [Pricing](#pricing)
 - **latency** — time-to-first-token vs. total generation time
 - **sessions** — conversations are fingerprinted, so parallel agents and
   side calls (title generators, summarizers) are tracked separately
@@ -71,6 +69,35 @@ miss, the `why` line names the culprit instead of leaving you to guess:
 
 Panels fold away gracefully on small terminals.
 
+## The web UI
+
+The dashboard's browser twin: open `http://127.0.0.1:4040/_llmscope/ui`
+while the proxy runs. Same live table, same turn analysis and miss
+diagnosis, plus selectable, scrollable, full request/response bodies.
+Everything is served by the proxy itself — no separate process, still
+localhost-only.
+
+## Replay
+
+```
+llmscope replay 47
+```
+
+re-sends captured request #47 through the proxy: the response streams to
+stdout and the replay is captured like any other request, so you can diff
+it against the original. Credentials come from your environment
+(`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) — captures never store them.
+
+## OTLP export
+
+```
+llmscope serve --otlp-endpoint http://127.0.0.1:4318
+```
+
+additionally emits one OTLP/HTTP JSON span per request — `gen_ai.*`
+attributes, token counts, cost, TTFT, one trace per conversation — so
+llmscope plugs into an existing OpenTelemetry collector without an SDK.
+
 ## Works with anything that speaks the protocols
 
 ```
@@ -100,7 +127,25 @@ overhead p50 0.09 ms   p95 0.09 ms
 
 Everything stays on your machine. Captures go to a local SQLite file
 (`llmscope run --db <path>` to relocate). Authorization headers and API keys
-are never stored — only request/response bodies and timing metadata.
+are never stored — only request/response bodies and timing metadata. The
+only outbound telemetry is OTLP export, which is off unless you point
+`--otlp-endpoint` somewhere.
+
+## Pricing
+
+Costs come from a built-in table generated from [LiteLLM's community
+pricing data](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)
+with per-model cache read/write rates (`python scripts/update_prices.py`
+regenerates it). Gateways that report exact cost per response — OpenRouter
+sends `usage.cost` — override the table. To price local or custom models,
+drop a `prices.toml` next to the capture db:
+
+```toml
+[[model]]
+prefix = "qwen3"     # matched against the model name, longest prefix wins
+input = 0.2          # $/Mtok
+output = 0.8         # cache_read / cache_write optional, default to input
+```
 
 ## Install
 
@@ -120,10 +165,12 @@ iTerm2, kitty, most modern terminals).
 
 ## Roadmap
 
-- [ ] pricing overrides via config file (built-ins regenerate from LiteLLM's table)
-- [ ] web UI for deep inspection and prompt diffing
-- [ ] OTLP export
-- [ ] request replay
+- [x] pricing overrides via config file — `prices.toml`, see [Pricing](#pricing)
+- [x] web UI for deep inspection — `/_llmscope/ui` on the proxy port
+- [x] OTLP export — `--otlp-endpoint`
+- [x] request replay — `llmscope replay <id>`
+- [ ] HAR / JSONL session export
+- [ ] `llmscope check` — CI mode that fails the build on cache-buster regressions
 
 ## License
 
