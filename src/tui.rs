@@ -979,7 +979,7 @@ fn draw_sessions(f: &mut Frame, app: &App, labels: &SessionLabels, area: Rect) {
         e.spend += r.cost_usd;
     }
     let mut sessions: Vec<(&str, Agg)> = agg.into_iter().collect();
-    sessions.sort_by(|a, b| b.1.last_id.cmp(&a.1.last_id));
+    sessions.sort_by_key(|(_, a)| std::cmp::Reverse(a.last_id));
 
     let visible = area.height.saturating_sub(2) as usize;
     let lines: Vec<Line> = sessions
