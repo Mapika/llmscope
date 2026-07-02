@@ -787,7 +787,10 @@ fn draw_tokens_per_sec(f: &mut Frame, app: &App, area: Rect) {
     let inner_w = area.width.saturating_sub(2).max(1) as usize;
     let dot_cols = inner_w * 2;
     let now_ms = app_now_ms(app);
-    let window_start = now_ms - dot_cols as i64 * 1000;
+    // Anchor the window to whole seconds so each dot column is a fixed
+    // wall-clock second; a millisecond-precise anchor drifts the bucket
+    // boundaries every redraw and the shape wobbles instead of sliding.
+    let window_start = (now_ms / 1000 + 1 - dot_cols as i64) * 1000;
 
     let mut buckets = vec![0f64; dot_cols];
     for r in &app.records {
@@ -845,7 +848,7 @@ fn draw_ttft(f: &mut Frame, app: &App, area: Rect) {
         .records
         .iter()
         .filter(|r| r.ttft_ms >= 0)
-        .take(inner_w * 2)
+        .take(inner_w)
         .map(|r| r.ttft_ms as u64)
         .collect();
     vals.reverse();
@@ -855,13 +858,18 @@ fn draw_ttft(f: &mut Frame, app: &App, area: Rect) {
         vals.iter().sum::<u64>() / vals.len() as u64
     };
 
+    // Right-aligned, one cell-wide bar per request, newest window only:
+    // bars keep their shape and slide left as requests arrive, instead of
+    // stretching to fit and reshaping on every new sample.
     let dot_cols = inner_w * 2;
     let data: Vec<u64> = if vals.is_empty() {
         Vec::new()
     } else {
-        (0..dot_cols)
-            .map(|i| vals[i * vals.len() / dot_cols])
-            .collect()
+        let mut d = vec![0u64; dot_cols.saturating_sub(vals.len() * 2)];
+        for v in &vals {
+            d.extend([*v, *v]);
+        }
+        d
     };
 
     let block = panel(vec![
@@ -918,20 +926,23 @@ fn draw_context_growth(f: &mut Frame, app: &App, labels: &SessionLabels, area: R
         .records
         .iter()
         .filter(|r| selected_session.is_empty() || r.session == selected_session)
-        .take(inner_w * 2)
+        .take(inner_w)
         .map(|r| (r.input_tokens + r.cache_read_tokens + r.cache_write_tokens).max(0) as u64)
         .collect();
     vals.reverse();
     let latest = vals.last().copied().unwrap_or(0);
-    // Index-based chart, not a time series: stretch the turns across the full
-    // panel width (and downsample once there are more turns than dot columns).
+    // Index-based chart, not a time series: right-aligned with one cell per
+    // turn, so the ramp holds its shape and slides left as turns arrive
+    // instead of stretching to fit the panel.
     let dot_cols = inner_w * 2;
     let data: Vec<u64> = if vals.is_empty() {
         Vec::new()
     } else {
-        (0..dot_cols)
-            .map(|i| vals[i * vals.len() / dot_cols])
-            .collect()
+        let mut d = vec![0u64; dot_cols.saturating_sub(vals.len() * 2)];
+        for v in &vals {
+            d.extend([*v, *v]);
+        }
+        d
     };
 
     let (tag, tag_color) = session_tag(labels, &selected_session);
