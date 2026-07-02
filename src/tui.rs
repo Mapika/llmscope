@@ -224,8 +224,8 @@ pub async fn run(port: u16) -> Result<()> {
 
         // Blocking poll with a short timeout keeps the loop at ~20fps without
         // needing crossterm's async event stream.
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()? {
                 // Windows delivers both press and release events.
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -245,14 +245,16 @@ pub async fn run(port: u16) -> Result<()> {
                             app.selected =
                                 (app.selected + 1).min(app.records.len().saturating_sub(1));
                         }
-                        KeyCode::Enter | KeyCode::Char('d') => {
+                        KeyCode::Enter | KeyCode::Char('d') | KeyCode::Char('b') => {
+                            let body_view = key.code == KeyCode::Char('b');
                             if let Some(rec) = app.records.get(app.selected) {
                                 let screen = match fetch_diff(&client, &base, rec.id).await {
+                                    Ok(payload) if body_view => build_body_screen(&payload),
                                     Ok(payload) => build_diff_screen(&payload),
                                     Err(e) => DiffScreen {
                                         title: format!("#{}", rec.id),
                                         lines: vec![Line::from(Span::styled(
-                                            format!("could not load diff: {e}"),
+                                            format!("could not load: {e}"),
                                             Style::new().fg(Color::Rgb(248, 113, 113)),
                                         ))],
                                         scroll: 0,
@@ -287,7 +289,6 @@ pub async fn run(port: u16) -> Result<()> {
                     },
                 }
             }
-        }
     };
 
     ratatui::restore();
@@ -371,6 +372,8 @@ fn draw(f: &mut Frame, app: &mut App) {
             Span::styled(" select", Style::new().fg(DIM)),
             Span::styled("   ⏎", Style::new().fg(ACCENT).bold()),
             Span::styled(" turn diff", Style::new().fg(DIM)),
+            Span::styled("   b", Style::new().fg(ACCENT).bold()),
+            Span::styled(" body", Style::new().fg(DIM)),
             Span::styled(
                 format!("   proxy 127.0.0.1:{}", app.port),
                 Style::new().fg(DIM),
@@ -435,6 +438,46 @@ fn stat_line(label: &str, spans: Vec<Span<'static>>) -> Line<'static> {
     )];
     all.extend(spans);
     Line::from(all)
+}
+
+/// Raw request JSON (pretty-printed) and captured response, scrollable.
+fn build_body_screen(p: &DiffPayload) -> DiffScreen {
+    const MAX_LINES: usize = 4_000;
+    let title = format!("#{} · {} · bodies", p.curr.id, p.curr.model);
+    let section = |name: &str| {
+        Line::from(Span::styled(
+            format!(" ── {name} "),
+            Style::new().fg(ACCENT).bold(),
+        ))
+    };
+    let mut lines: Vec<Line<'static>> = vec![Line::default(), section("request")];
+
+    let pretty = serde_json::from_str::<serde_json::Value>(&p.curr_body)
+        .and_then(|v| serde_json::to_string_pretty(&v))
+        .unwrap_or_else(|_| p.curr_body.clone());
+    for l in pretty.lines().take(MAX_LINES) {
+        lines.push(Line::from(Span::styled(
+            format!(" {l}"),
+            Style::new().fg(Color::Rgb(150, 156, 170)),
+        )));
+    }
+
+    lines.push(Line::default());
+    lines.push(section("response"));
+    let remaining = MAX_LINES.saturating_sub(lines.len());
+    for l in p.curr_response_body.lines().take(remaining) {
+        lines.push(Line::from(Span::styled(
+            format!(" {l}"),
+            Style::new().fg(Color::Rgb(150, 156, 170)),
+        )));
+    }
+    if pretty.lines().count() + p.curr_response_body.lines().count() > MAX_LINES {
+        lines.push(Line::from(Span::styled(
+            " … truncated",
+            Style::new().fg(DIM),
+        )));
+    }
+    DiffScreen { title, lines, scroll: 0 }
 }
 
 fn build_diff_screen(p: &DiffPayload) -> DiffScreen {
@@ -935,6 +978,16 @@ fn draw_latency(f: &mut Frame, app: &App, area: Rect) {
     let errors = app.records.iter().filter(|r| r.status >= 400 || r.status == 0).count();
     let estimated = app.records.iter().filter(|r| r.estimated).count();
 
+    // Cache economics: what caching saved, and what cold re-sends wasted.
+    let mut seen_sessions: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let (mut saved, mut wasted) = (0.0f64, 0.0f64);
+    for r in app.records.iter().rev() {
+        let had_prior = !r.session.is_empty() && !seen_sessions.insert(r.session.as_str());
+        let (s, w) = crate::record::cache_economics(r, had_prior);
+        saved += s;
+        wasted += w;
+    }
+
     let value = |s: String| Span::styled(s, Style::new().bold());
     let lines = vec![
         stat_line("ttft", vec![
@@ -958,6 +1011,21 @@ fn draw_latency(f: &mut Frame, app: &App, area: Rect) {
         stat_line("est rows", vec![
             value(estimated.to_string()),
             Span::styled(" (~)", Style::new().fg(DIM)),
+        ]),
+        stat_line("cache", vec![
+            Span::styled(
+                format!("saved {}", fmt_cost(saved)),
+                Style::new().fg(Color::Rgb(74, 222, 128)).bold(),
+            ),
+            Span::styled(" · ", Style::new().fg(DIM)),
+            Span::styled(
+                format!("wasted {}", fmt_cost(wasted)),
+                if wasted > 0.01 {
+                    Style::new().fg(Color::Rgb(248, 113, 113)).bold()
+                } else {
+                    Style::new().fg(DIM)
+                },
+            ),
         ]),
     ];
 
@@ -1333,6 +1401,7 @@ fn demo_diff_payload(now_ms: i64) -> DiffPayload {
     DiffPayload {
         curr: rec(47, 12_600),
         curr_body,
+        curr_response_body: String::new(),
         prev: Some(rec(46, 11_900)),
         prev_body: Some(prev_body),
     }

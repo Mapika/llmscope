@@ -43,12 +43,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// A request plus the previous request of the same provider/model/path —
-/// everything the TUI needs to render a turn diff. Bodies stay localhost-only.
+/// A request (with both bodies) plus the previous request of the same
+/// session — everything the TUI needs to render a turn diff or the body
+/// viewer. Bodies stay localhost-only.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct DiffPayload {
     pub curr: RequestRecord,
     pub curr_body: String,
+    #[serde(default)]
+    pub curr_response_body: String,
     pub prev: Option<RequestRecord>,
     pub prev_body: Option<String>,
 }
@@ -58,17 +61,18 @@ async fn get_diff(
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> Response {
     let result = (|| -> anyhow::Result<Option<DiffPayload>> {
-        let Some((curr, curr_body)) = st.store.with_body(id, None)? else {
+        let Some((curr, curr_body, curr_response_body)) = st.store.with_body(id, None)? else {
             return Ok(None);
         };
         let prev = st.store.with_body(0, Some(&curr))?;
         let (prev, prev_body) = match prev {
-            Some((r, b)) => (Some(r), Some(b)),
+            Some((r, b, _)) => (Some(r), Some(b)),
             None => (None, None),
         };
         Ok(Some(DiffPayload {
             curr,
             curr_body,
+            curr_response_body,
             prev,
             prev_body,
         }))
@@ -119,9 +123,9 @@ async fn proxy_handler(State(st): State<Arc<AppState>>, req: Request) -> Respons
     let (parts, body) = req.into_parts();
     let path = parts.uri.path().to_string();
 
-    let (provider, upstream) = if let Some(_) = path.strip_prefix("/anthropic/") {
+    let (provider, upstream) = if path.strip_prefix("/anthropic/").is_some() {
         (Provider::Anthropic, st.anthropic_upstream.clone())
-    } else if let Some(_) = path.strip_prefix("/openai/") {
+    } else if path.strip_prefix("/openai/").is_some() {
         (Provider::OpenAI, st.openai_upstream.clone())
     } else {
         return (

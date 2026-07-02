@@ -2,54 +2,87 @@
 
 **Wireshark for LLM traffic.** A zero-config local proxy that shows you what your agents *actually* send — every request, token, cache hit and dollar — live, in a `top`-style TUI.
 
-No SDK. No account. No config. One binary.
+No SDK. No account. No config. One binary. **~0.1 ms of added latency.**
+
+![llmscope dashboard](assets/dashboard.png)
 
 ```
 llmscope run -- claude        # terminal 1: your agent, unchanged
 llmscope top                  # terminal 2: watch everything it does
 ```
 
-```
-┌ llmscope ── ● proxy :4040 ──────────────────────────────────────────────────┐
-│ req 47 │ in 1.24M │ cached 71% │ out 38.4k │ spend $4.83                    │
-└──────────────────────────────────────────────────────────────────────────────┘
-┌ tokens/s  peak 214 ───────────────────┐┌ time-to-first-token  avg 480ms ────┐
-│      ▄▆█▇▅▂    ▁▃▅▇█▆▄▂▁      ▂▄▆█▆▃  ││ ▂▁▂▃▂▁█▂▁▂▂▃▂▁▂▇▂▁                 │
-└───────────────────────────────────────┘└────────────────────────────────────┘
-┌ requests ────────────────────────────────────────────────────────────────────┐
-│ TIME      MODEL              IN      CACHE   OUT     TTFT    TOTAL    COST   │
-│ 14:02:11  claude-sonnet-4-5  82.1k   94%     1.2k    412ms   8.2s     $0.11  │
-│ 14:01:58  claude-haiku-4-5   3.4k    0%      210     190ms   1.1s     $0.004 │
-└──────────────────────────────────────────────────────────────────────────────┘
-  q quit
-```
+## Why
+
+Coding agents burn tokens invisibly. A single agent turn can re-send a
+100k-token context; a cache misconfiguration can silently multiply your bill
+by 10x; a "quick" session can fan out into side agents you never see.
+llmscope sits between your agent and the API and makes all of it visible —
+locally, with nothing leaving your machine.
 
 ## How it works
 
 `llmscope run -- <cmd>` starts a local proxy and launches your command with
 `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` pointed at it. Claude Code, Codex,
-Gemini CLI and every major SDK respect those variables, so there is nothing
-to instrument. Responses stream through untouched — llmscope tees the bytes,
-parses the SSE stream on the side, and records:
+Gemini CLI, opencode, and every major SDK respect those variables, so there
+is nothing to instrument. Responses stream through untouched — llmscope tees
+the bytes, parses the SSE stream on the side, and records:
 
 - **tokens** — input / output / cache reads / cache writes, per request
 - **cost** — priced per model, including cache read/write multipliers
+  (gateway-served Claude models are priced correctly too)
 - **latency** — time-to-first-token vs. total generation time
+- **sessions** — conversations are fingerprinted, so parallel agents and
+  side calls (title generators, summarizers) are tracked separately
 - **full bodies** — every request and response, in a local SQLite file
 
-`llmscope top` attaches to the proxy from another terminal and renders the
-live view. Select any request with `↑↓` and hit `⏎` for the **turn diff**:
-what your agent kept, appended, or dropped versus its previous request —
-and whether the re-sent context was actually served from cache or billed
-in full.
+## The turn diff
 
-## Local models too
+Select any request and hit `⏎` to see what your agent *changed* since its
+previous turn: system prompt and tools changed/unchanged, messages
+kept/appended/dropped (a broken prefix exposes history rewrites like
+compaction), and the economics line — the re-sent context estimate versus
+the cache reads the API actually reported:
 
-Point the OpenAI-protocol upstream at anything that speaks it:
+![turn diff](assets/turn-diff.png)
+
+`✗ no cache reads — full re-send billed` on a 100k-token turn is the most
+expensive line of output you'll ever be glad to see.
+
+## The dashboard
+
+- **tokens/s** and **TTFT** as braille area graphs with live gradients
+- **context per turn** — watch the selected conversation's context balloon
+- **sessions** — one row per conversation: requests, tokens, spend, cache meter
+- **models** — spend meters per model
+- **health** — avg/p95 TTFT, generation speed, errors, and cache economics:
+  dollars *saved* by caching and dollars *wasted* on cold re-sends
+- `⏎` turn diff · `b` raw request/response bodies · `↑↓` select
+
+Panels fold away gracefully on small terminals.
+
+## Works with anything that speaks the protocols
 
 ```
-llmscope run --openai-upstream http://127.0.0.1:11434 -- python my_agent.py   # Ollama
-llmscope run --openai-upstream http://127.0.0.1:8000  -- python my_agent.py   # vLLM
+# Claude Code
+llmscope run -- claude
+
+# opencode via OpenRouter (set the provider baseURL to the proxy)
+llmscope serve --openai-upstream https://openrouter.ai/api
+
+# Local models: Ollama, vLLM, llama.cpp
+llmscope run --openai-upstream http://127.0.0.1:11434 -- python my_agent.py
+```
+
+## Overhead
+
+Streaming passthrough with the capture tee off the hot path. Measured with
+`scripts/bench_overhead.py` (300 samples, local mock upstream, reused
+connection):
+
+```
+direct   p50 0.21 ms   p95 0.29 ms
+proxied  p50 0.30 ms   p95 0.38 ms
+overhead p50 0.09 ms   p95 0.09 ms
 ```
 
 ## Privacy
@@ -58,22 +91,22 @@ Everything stays on your machine. Captures go to a local SQLite file
 (`llmscope run --db <path>` to relocate). Authorization headers and API keys
 are never stored — only request/response bodies and timing metadata.
 
-## Status
+## Install
 
-Early. Core proxy + TUI + turn diff + session grouping work. Planned next:
+```
+cargo install --path .        # from a checkout
+```
 
-- [x] **turn diff** — see exactly what your agent re-sends every turn
-- [x] **session grouping** — conversations fingerprinted and tracked
-  separately, so a title agent doesn't muddy your main loop's stats
-- [x] dense dashboard: sessions panel, per-model spend meters,
-  context-growth graph, latency/health sidebar
-- [ ] cache-miss cost analysis ("this session wasted $X on cache misses")
-- [ ] request detail / body viewer in the TUI
-- [ ] web UI for deep inspection
+Requires a terminal with truecolor + braille support (Windows Terminal,
+iTerm2, kitty, most modern terminals).
+
+## Roadmap
+
 - [ ] pricing table via config file (built-ins cover common models)
+- [ ] web UI for deep inspection and prompt diffing
+- [ ] OTLP export
+- [ ] request replay
 
-## Build
+## License
 
-```
-cargo build --release
-```
+MIT

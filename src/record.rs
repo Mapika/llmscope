@@ -66,6 +66,28 @@ pub fn price(model: &str) -> Option<(f64, f64)> {
         .map(|(_, i, o)| (*i, *o))
 }
 
+/// Dollars saved by cache reads (vs paying full input price), and dollars
+/// wasted on full-price input that a warm cache would have served — the
+/// record must be a follow-up turn (`had_prior_turn`) for waste to count.
+pub fn cache_economics(rec: &RequestRecord, had_prior_turn: bool) -> (f64, f64) {
+    let Some((pin, _)) = price(&rec.model) else {
+        return (0.0, 0.0);
+    };
+    let read_mult = if rec.provider == "anthropic" || rec.model.contains("claude") {
+        0.1
+    } else {
+        0.5
+    };
+    let saved = rec.cache_read_tokens as f64 * (1.0 - read_mult) * pin / 1_000_000.0;
+    // Below ~1k tokens the prefix wouldn't cache anyway.
+    let wasted = if had_prior_turn && rec.cache_read_tokens == 0 && rec.input_tokens > 1_024 {
+        rec.input_tokens as f64 * (1.0 - read_mult) * pin / 1_000_000.0
+    } else {
+        0.0
+    };
+    (saved, wasted)
+}
+
 pub fn cost_usd(provider: Provider, model: &str, usage: &Usage) -> f64 {
     let Some((pin, pout)) = price(model) else {
         return 0.0;

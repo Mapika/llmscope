@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "Wireshark for LLM traffic — a zero-config local proxy with a top-style TUI"
 license = "MIT"
+readme = "README.md"
+keywords = ["llm", "proxy", "tui", "observability", "agents"]
+categories = ["command-line-utilities", "development-tools::profiling"]
 
 [dependencies]
 anyhow = "1"

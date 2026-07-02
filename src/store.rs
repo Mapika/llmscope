@@ -85,20 +85,20 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
-    /// A record plus its request body, or the closest earlier request of the
-    /// same provider/model/path — the previous turn of the same agent loop.
+    /// A record plus its request and response bodies, or the closest earlier
+    /// request of the same session — the previous turn of the same agent loop.
     pub fn with_body(
         &self,
         id: i64,
         prev_of: Option<&RequestRecord>,
-    ) -> Result<Option<(RequestRecord, String)>> {
+    ) -> Result<Option<(RequestRecord, String, String)>> {
         let conn = self.conn.lock().unwrap();
         let (sql, p): (&str, Vec<rusqlite::types::Value>) = match prev_of {
             None => (
                 "SELECT id, ts_ms, provider, model, path, status,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                         ttft_ms, duration_ms, cost_usd, streamed, estimated, session_key,
-                        request_body
+                        request_body, response_body
                  FROM requests WHERE id = ?1",
                 vec![id.into()],
             ),
@@ -108,7 +108,7 @@ impl Store {
                 "SELECT id, ts_ms, provider, model, path, status,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                         ttft_ms, duration_ms, cost_usd, streamed, estimated, session_key,
-                        request_body
+                        request_body, response_body
                  FROM requests
                  WHERE id < ?1 AND session_key = ?2
                  ORDER BY id DESC LIMIT 1",
@@ -118,7 +118,7 @@ impl Store {
                 "SELECT id, ts_ms, provider, model, path, status,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                         ttft_ms, duration_ms, cost_usd, streamed, estimated, session_key,
-                        request_body
+                        request_body, response_body
                  FROM requests
                  WHERE id < ?1 AND provider = ?2 AND model = ?3 AND path = ?4
                  ORDER BY id DESC LIMIT 1",
@@ -152,6 +152,7 @@ impl Store {
                     session: r.get(15)?,
                 },
                 r.get::<_, Option<String>>(16)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(17)?.unwrap_or_default(),
             ))
         })?;
         Ok(rows.next().transpose()?)
