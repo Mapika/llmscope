@@ -49,7 +49,15 @@ the cache reads the API actually reported:
 ![turn diff](assets/turn-diff.png)
 
 `✗ no cache reads — full re-send billed` on a 100k-token turn is the most
-expensive line of output you'll ever be glad to see.
+expensive line of output you'll ever be glad to see. And when a turn does
+miss, the `why` line names the culprit instead of leaving you to guess:
+
+- the exact character where the system prompt diverged (timestamps
+  re-rendered into the prompt every turn are the classic cache-buster)
+- which tool definition changed, appeared, or vanished
+- the message where history was rewritten (compaction, summarization)
+- missing `cache_control` breakpoints — explicit caching never enabled
+- an idle gap longer than the cache TTL
 
 ## The dashboard
 

@@ -583,7 +583,9 @@ fn build_diff_screen(p: &DiffPayload) -> DiffScreen {
             let reported = p.curr.cache_read_tokens;
             if est_resent_tok > 0 {
                 let ratio = reported as f64 / est_resent_tok as f64;
-                let verdict = if reported == 0 && est_resent_tok > 1_000 {
+                let miss = reported == 0 && est_resent_tok > 1_000;
+                let partial = reported > 0 && ratio < 0.7;
+                let verdict = if miss {
                     Span::styled(
                         "✗ no cache reads — full re-send billed",
                         Style::new().fg(RED).bold(),
@@ -604,6 +606,87 @@ fn build_diff_screen(p: &DiffPayload) -> DiffScreen {
                         verdict,
                     ],
                 ));
+
+                // The miss diagnosis: name the culprit, don't just meter it.
+                if miss || partial {
+                    let anthropic = provider_of(&p.curr) == Provider::Anthropic;
+                    let gap_ms = p.prev.as_ref().map_or(0, |pr| p.curr.ts_ms - pr.ts_ms);
+                    let causes = diff::diagnose_miss(&prevc, &curr, &d, anthropic, gap_ms);
+                    for (i, cause) in causes.iter().enumerate() {
+                        let label = if i == 0 { "why" } else { "" };
+                        match cause {
+                            diff::MissCause::NoCacheControl => lines.push(stat_line(
+                                label,
+                                vec![Span::styled(
+                                    "no cache_control breakpoints in the request — explicit caching is off",
+                                    Style::new().fg(YELLOW),
+                                )],
+                            )),
+                            diff::MissCause::SystemChanged {
+                                at_char,
+                                prev_snippet,
+                                curr_snippet,
+                            } => {
+                                lines.push(stat_line(
+                                    label,
+                                    vec![Span::styled(
+                                        format!("system prompt changed at char {at_char}"),
+                                        Style::new().fg(YELLOW),
+                                    )],
+                                ));
+                                lines.push(Line::from(vec![
+                                    Span::styled("             prev  ", Style::new().fg(DIM)),
+                                    Span::styled(prev_snippet.clone(), Style::new().fg(RED)),
+                                ]));
+                                lines.push(Line::from(vec![
+                                    Span::styled("             curr  ", Style::new().fg(DIM)),
+                                    Span::styled(curr_snippet.clone(), Style::new().fg(GREEN)),
+                                ]));
+                            }
+                            diff::MissCause::ToolsChanged { detail } => lines.push(stat_line(
+                                label,
+                                vec![Span::styled(
+                                    format!("tool definitions changed — {detail}"),
+                                    Style::new().fg(YELLOW),
+                                )],
+                            )),
+                            diff::MissCause::HistoryRewritten { at_msg } => lines.push(stat_line(
+                                label,
+                                vec![Span::styled(
+                                    format!(
+                                        "history rewritten at message {at_msg} — cacheable prefix broken (compaction?)"
+                                    ),
+                                    Style::new().fg(YELLOW),
+                                )],
+                            )),
+                            diff::MissCause::TtlExpired { gap_secs } => {
+                                let gap = if *gap_secs >= 60 {
+                                    format!("{}m", gap_secs / 60)
+                                } else {
+                                    format!("{gap_secs}s")
+                                };
+                                lines.push(stat_line(
+                                    label,
+                                    vec![Span::styled(
+                                        format!(
+                                            "prefix unchanged, but the previous turn was {gap} ago — cache TTL (~5 min) expired"
+                                        ),
+                                        Style::new().fg(YELLOW),
+                                    )],
+                                ));
+                            }
+                        }
+                    }
+                    if causes.is_empty() {
+                        lines.push(stat_line(
+                            "why",
+                            vec![Span::styled(
+                                "prefix unchanged — miss looks provider-side (cache eviction)",
+                                Style::new().fg(DIM),
+                            )],
+                        ));
+                    }
+                }
             }
 
             lines.push(Line::default());
@@ -1315,11 +1398,18 @@ pub fn render_demo_html(width: u16, height: u16, view: &str) -> Result<String> {
 }
 
 /// Synthetic agent turn for the diff-view screenshot: prev has six messages,
-/// curr appends an assistant tool call and its result.
+/// curr appends a tool call and its result — but a timestamp embedded in the
+/// system prompt busts the cache, so the shot shows the miss diagnosis.
 fn demo_diff_payload(now_ms: i64) -> DiffPayload {
     use serde_json::json;
 
-    let system = "You are an agentic coding assistant working in a Rust repository. ".repeat(230);
+    let system = |hms: &str| {
+        format!(
+            "You are an agentic coding assistant working in a Rust repository. \
+             Current time: 2026-07-02 09:14:{hms}. {}",
+            "Follow the project conventions and keep diffs minimal. ".repeat(260)
+        )
+    };
     let tools: Vec<_> = (0..24)
         .map(|i| {
             json!({
@@ -1332,7 +1422,11 @@ fn demo_diff_payload(now_ms: i64) -> DiffPayload {
 
     let mut messages = vec![json!({
         "role": "user",
-        "content": "Fix the failing widget tests in llmscope and make the graph smoother"
+        "content": [{
+            "type": "text",
+            "text": "Fix the failing widget tests in llmscope and make the graph smoother",
+            "cache_control": {"type": "ephemeral"}
+        }]
     })];
     for i in 0..4 {
         messages.push(json!({
@@ -1352,7 +1446,7 @@ fn demo_diff_payload(now_ms: i64) -> DiffPayload {
         }));
     }
     let prev_body = json!({
-        "model": "claude-sonnet-4-5", "system": system, "tools": tools, "messages": messages
+        "model": "claude-sonnet-5", "system": system("22"), "tools": tools, "messages": messages
     })
     .to_string();
 
@@ -1371,21 +1465,21 @@ fn demo_diff_payload(now_ms: i64) -> DiffPayload {
         }]
     }));
     let curr_body = json!({
-        "model": "claude-sonnet-4-5", "system": system, "tools": tools, "messages": messages
+        "model": "claude-sonnet-5", "system": system("41"), "tools": tools, "messages": messages
     })
     .to_string();
 
-    let rec = |id: i64, cache_read: i64| RequestRecord {
+    let rec = |id: i64, input: i64, cache_read: i64, cache_write: i64| RequestRecord {
         id,
         ts_ms: now_ms - (48 - id) * 11_000,
         provider: "anthropic".to_string(),
-        model: "claude-sonnet-4-5".to_string(),
+        model: "claude-sonnet-5".to_string(),
         path: "/v1/messages".to_string(),
         status: 200,
-        input_tokens: 850,
+        input_tokens: input,
         output_tokens: 1_400,
         cache_read_tokens: cache_read,
-        cache_write_tokens: 420,
+        cache_write_tokens: cache_write,
         ttft_ms: 480,
         duration_ms: 9_200,
         cost_usd: 0.048,
@@ -1394,10 +1488,11 @@ fn demo_diff_payload(now_ms: i64) -> DiffPayload {
         session: "demo-main-loop".to_string(),
     };
     DiffPayload {
-        curr: rec(47, 12_600),
+        // The timestamp change re-billed the whole context as cache writes.
+        curr: rec(47, 900, 0, 13_800),
         curr_body,
         curr_response_body: String::new(),
-        prev: Some(rec(46, 11_900)),
+        prev: Some(rec(46, 850, 11_900, 420)),
         prev_body: Some(prev_body),
     }
 }

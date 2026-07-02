@@ -77,7 +77,7 @@ fn session_fingerprint(v: &Value) -> String {
 }
 
 /// Collect every human-readable string out of arbitrarily shaped content.
-fn canonical_text(v: &Value, out: &mut String) {
+pub(crate) fn canonical_text(v: &Value, out: &mut String) {
     match v {
         Value::String(s) => out.push_str(s),
         Value::Array(items) => items.iter().for_each(|i| canonical_text(i, out)),
