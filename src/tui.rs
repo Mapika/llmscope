@@ -174,6 +174,18 @@ struct App {
     selected: usize,
     table: TableState,
     view: View,
+    /// Wall-clock override for offline frame rendering (`debug-render`);
+    /// live `top` leaves this None and draws against the real clock.
+    now_ms: Option<i64>,
+}
+
+fn app_now_ms(app: &App) -> i64 {
+    app.now_ms.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    })
 }
 
 pub async fn run(port: u16) -> Result<()> {
@@ -190,6 +202,7 @@ pub async fn run(port: u16) -> Result<()> {
         selected: 0,
         table: TableState::default(),
         view: View::Dashboard,
+        now_ms: None,
     };
 
     let mut terminal = ratatui::init();
@@ -773,10 +786,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 fn draw_tokens_per_sec(f: &mut Frame, app: &App, area: Rect) {
     let inner_w = area.width.saturating_sub(2).max(1) as usize;
     let dot_cols = inner_w * 2;
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+    let now_ms = app_now_ms(app);
     let window_start = now_ms - dot_cols as i64 * 1000;
 
     let mut buckets = vec![0f64; dot_cols];
@@ -1382,9 +1392,84 @@ pub fn render_demo_html(width: u16, height: u16, view: &str) -> Result<String> {
         selected: 0,
         table: TableState::default(),
         view: View::Dashboard,
+        now_ms: None,
     };
     if view == "diff" {
         app.view = View::Diff(build_diff_screen(&demo_diff_payload(now_ms)));
+    }
+
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut term = ratatui::Terminal::new(backend)?;
+    term.draw(|f| draw(f, &mut app))?;
+    Ok(buffer_to_html(term.backend().buffer()))
+}
+
+/// Render one frame of the TUI from a real capture db into styled HTML.
+/// `now_ms` anchors the clock and hides requests that hadn't finished yet,
+/// so stepping it through a captured session replays the dashboard frame by
+/// frame — this is how the README GIF is produced.
+pub fn render_db_html(
+    db: &std::path::Path,
+    width: u16,
+    height: u16,
+    view: &str,
+    now_ms: Option<i64>,
+    id: Option<i64>,
+) -> Result<String> {
+    use anyhow::Context;
+
+    let store = crate::store::Store::open(db)?;
+    let now_ms = now_ms.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    });
+    let mut records = VecDeque::new();
+    for r in store.recent(0, 5000)? {
+        // Live `top` learns about a request when it completes; mirror that.
+        if r.ts_ms + r.duration_ms.max(0) <= now_ms {
+            records.push_front(r);
+        }
+    }
+    let last_id = records.front().map_or(0, |r| r.id);
+
+    let mut app = App {
+        port: 4040,
+        records,
+        last_id,
+        connected: true,
+        selected: 0,
+        table: TableState::default(),
+        view: View::Dashboard,
+        now_ms: Some(now_ms),
+    };
+    match view {
+        "dashboard" => {}
+        "diff" | "body" => {
+            let id = id.context("--id is required for --view diff|body with --db")?;
+            let (curr, curr_body, curr_response_body) = store
+                .with_body(id, None)?
+                .with_context(|| format!("no captured request with id {id}"))?;
+            let prev = store.with_body(0, Some(&curr))?;
+            let (prev, prev_body) = match prev {
+                Some((r, b, _)) => (Some(r), Some(b)),
+                None => (None, None),
+            };
+            let payload = DiffPayload {
+                curr,
+                curr_body,
+                curr_response_body,
+                prev,
+                prev_body,
+            };
+            app.view = View::Diff(if view == "body" {
+                build_body_screen(&payload)
+            } else {
+                build_diff_screen(&payload)
+            });
+        }
+        other => anyhow::bail!("unknown view `{other}` — expected dashboard | diff | body"),
     }
 
     let backend = ratatui::backend::TestBackend::new(width, height);

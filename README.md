@@ -4,7 +4,11 @@
 
 No SDK. No account. No config. One binary. **~0.1 ms of added latency.**
 
-![llmscope dashboard](assets/dashboard.png)
+![llmscope watching two coding agents work, replayed from a real capture](assets/demo.gif)
+
+*Real traffic, replayed: two coding agents (Claude Haiku 4.5 + GPT-5 mini via
+OpenRouter) fixing bugs in parallel — and a hidden title-generator failing
+with a 400 on every session, which nobody would see without a proxy.*
 
 ```
 llmscope run -- claude        # terminal 1: your agent, unchanged
@@ -46,9 +50,10 @@ the cache reads the API actually reported:
 
 ![turn diff](assets/turn-diff.png)
 
-`✗ no cache reads — full re-send billed` on a 100k-token turn is the most
-expensive line of output you'll ever be glad to see. And when a turn does
-miss, the `why` line names the culprit instead of leaving you to guess:
+That screenshot is a real miss, caught live: an agent session resumed after
+a 5-minute idle gap re-sent its entire 15k-token context at full price, and
+the `why` line names the culprit instead of leaving you to guess. It knows
+about the others too:
 
 - the exact character where the system prompt diverged (timestamps
   re-rendered into the prompt every turn are the classic cache-buster)
@@ -66,6 +71,8 @@ miss, the `why` line names the culprit instead of leaving you to guess:
 - **health** — avg/p95 TTFT, generation speed, errors, and cache economics:
   dollars *saved* by caching and dollars *wasted* on cold re-sends
 - `⏎` turn diff · `b` raw request/response bodies · `↑↓` select
+
+![llmscope dashboard](assets/dashboard.png)
 
 Panels fold away gracefully on small terminals.
 

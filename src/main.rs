@@ -79,18 +79,29 @@ enum Cmd {
         #[arg(long, default_value_t = 4040)]
         port: u16,
     },
-    /// Render a demo TUI frame to HTML (for screenshots)
+    /// Render a TUI frame to HTML (for screenshots and the README GIF)
     #[command(hide = true)]
     DebugRender {
         #[arg(long, default_value_t = 140)]
         width: u16,
         #[arg(long, default_value_t = 38)]
         height: u16,
-        /// Which screen to render: dashboard | diff
+        /// Which screen to render: dashboard | diff | body
         #[arg(long, default_value = "dashboard")]
         view: String,
         #[arg(long)]
         out: PathBuf,
+        /// Render from a real capture db instead of synthetic demo traffic
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Clock anchor (unix ms) when rendering from --db: requests that
+        /// finished after this instant are hidden, so stepping it replays
+        /// the session frame by frame
+        #[arg(long)]
+        now_ms: Option<i64>,
+        /// Request id for --view diff|body with --db
+        #[arg(long)]
+        id: Option<i64>,
     },
 }
 
@@ -132,8 +143,15 @@ async fn main() -> Result<()> {
             height,
             view,
             out,
+            db,
+            now_ms,
+            id,
         } => {
-            std::fs::write(&out, tui::render_demo_html(width, height, &view)?)?;
+            let html = match db {
+                Some(db) => tui::render_db_html(&db, width, height, &view, now_ms, id)?,
+                None => tui::render_demo_html(width, height, &view)?,
+            };
+            std::fs::write(&out, html)?;
             eprintln!("wrote {}", out.display());
             Ok(())
         }
