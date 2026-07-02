@@ -23,7 +23,8 @@ pub struct RequestRecord {
     pub duration_ms: i64,
     pub cost_usd: f64,
     pub streamed: bool,
-    /// True when the provider sent no usage block and numbers are heuristic.
+    /// True when the numbers are heuristic: the provider sent no usage
+    /// block, or the stream was cut short before the final usage frame.
     pub estimated: bool,
     /// Conversation fingerprint grouping requests of one agent run; empty
     /// for non-chat requests and rows captured before this field existed.

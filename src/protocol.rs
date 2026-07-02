@@ -176,6 +176,7 @@ fn sse_data_events(body: &[u8]) -> impl Iterator<Item = Value> + '_ {
 
 fn anthropic_sse(body: &[u8]) -> Usage {
     let mut u = Usage::default();
+    let mut content_deltas: i64 = 0;
     for v in sse_data_events(body) {
         match v.get("type").and_then(Value::as_str) {
             Some("message_start") => {
@@ -186,12 +187,19 @@ fn anthropic_sse(body: &[u8]) -> Usage {
                 u.cache_read = i64_at(usage, "cache_read_input_tokens");
                 u.cache_write = i64_at(usage, "cache_creation_input_tokens");
             }
+            Some("content_block_delta") => content_deltas += 1,
             Some("message_delta") => {
                 // Cumulative — the last one wins.
                 u.output = i64_at(&v["usage"], "output_tokens");
             }
             _ => {}
         }
+    }
+    if u.output == 0 && content_deltas > 0 {
+        // Truncated stream: the final usage frame never arrived, but output
+        // was generated (and billed). One delta is roughly one token.
+        u.output = content_deltas;
+        u.estimated = true;
     }
     u
 }

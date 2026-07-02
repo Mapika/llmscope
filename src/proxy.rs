@@ -186,6 +186,7 @@ async fn proxy_handler(State(st): State<Arc<AppState>>, req: Request) -> Respons
                     is_sse: false,
                     ttft: None,
                     duration: started.elapsed(),
+                    interrupted: false,
                 },
                 Vec::new(),
             );
@@ -223,33 +224,45 @@ async fn proxy_handler(State(st): State<Arc<AppState>>, req: Request) -> Respons
         is_sse,
         ttft: None,
         duration: Duration::ZERO,
+        interrupted: false,
     };
 
     // Tee the upstream stream: forward every chunk untouched, accumulate a
-    // copy, and record usage/timing once the stream ends. If the client
-    // disconnects mid-stream the record is dropped (v0 limitation).
-    let st2 = Arc::clone(&st);
+    // copy, and record usage/timing once the stream ends. `Capture` writes
+    // the record on drop, so a client that disconnects mid-stream (an agent
+    // user hitting Esc) still gets its billed input recorded.
+    let mut cap = Capture {
+        st: Arc::clone(&st),
+        ctx: Some(ctx),
+        buf: Vec::new(),
+        started,
+        completed: false,
+    };
     let mut upstream_stream = upstream_resp.bytes_stream();
     let tee = async_stream::stream! {
-        let mut ctx = ctx;
-        let mut buf: Vec<u8> = Vec::new();
+        let mut errored = false;
         while let Some(chunk) = upstream_stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    if ctx.ttft.is_none() {
-                        ctx.ttft = Some(started.elapsed());
+                    if let Some(ctx) = cap.ctx.as_mut()
+                        && ctx.ttft.is_none()
+                    {
+                        ctx.ttft = Some(cap.started.elapsed());
                     }
-                    buf.extend_from_slice(&bytes);
+                    cap.buf.extend_from_slice(&bytes);
                     yield Ok::<Bytes, reqwest::Error>(bytes);
                 }
                 Err(e) => {
+                    errored = true;
                     yield Err(e);
                     break;
                 }
             }
         }
-        ctx.duration = started.elapsed();
-        finalize(&st2, ctx, buf);
+        if !errored {
+            cap.mark_completed();
+        }
+        // cap drops here and writes the record.
     };
 
     let mut response = Response::builder().status(status);
@@ -275,6 +288,38 @@ struct FinishCtx {
     is_sse: bool,
     ttft: Option<Duration>,
     duration: Duration,
+    /// The stream was cut short (client disconnect or upstream error), so
+    /// parsed usage may be missing its final frame.
+    interrupted: bool,
+}
+
+/// Owns the capture state while a response streams through the tee and
+/// writes the record on drop — the one path that runs whether the stream
+/// finishes, errors, or is dropped by a disconnecting client.
+struct Capture {
+    st: Arc<AppState>,
+    ctx: Option<FinishCtx>,
+    buf: Vec<u8>,
+    started: Instant,
+    completed: bool,
+}
+
+impl Capture {
+    /// Mark the stream fully delivered; the record is still written on drop.
+    fn mark_completed(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        let Some(mut ctx) = self.ctx.take() else {
+            return;
+        };
+        ctx.duration = self.started.elapsed();
+        ctx.interrupted = !self.completed;
+        finalize(&self.st, ctx, std::mem::take(&mut self.buf));
+    }
 }
 
 fn finalize(st: &AppState, ctx: FinishCtx, resp_body: Vec<u8>) {
@@ -306,7 +351,7 @@ fn finalize(st: &AppState, ctx: FinishCtx, resp_body: Vec<u8>) {
         duration_ms: ctx.duration.as_millis() as i64,
         cost_usd: cost,
         streamed: ctx.streamed,
-        estimated: usage.estimated,
+        estimated: usage.estimated || ctx.interrupted,
         session: ctx.session,
     };
 
@@ -319,4 +364,70 @@ fn finalize(st: &AppState, ctx: FinishCtx, resp_body: Vec<u8>) {
             eprintln!("llmscope: failed to persist record: {e}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dropping the tee mid-stream (client hit Esc) must still persist the
+    /// record — the input tokens were billed regardless.
+    #[tokio::test]
+    async fn dropped_capture_still_records() {
+        let db = std::env::temp_dir().join(format!("llmscope-drop-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = Arc::new(Store::open(&db).unwrap());
+        let st = Arc::new(AppState::new(
+            "http://unused".into(),
+            "http://unused".into(),
+            Arc::clone(&store),
+        ));
+
+        let cap = Capture {
+            st,
+            ctx: Some(FinishCtx {
+                provider: Provider::Anthropic,
+                path: "/v1/messages".into(),
+                ts_ms: 1,
+                status: 200,
+                streamed: true,
+                req_model: Some("claude-sonnet-5".into()),
+                session: "s1".into(),
+                req_body: Bytes::from_static(b"{}"),
+                is_sse: true,
+                ttft: Some(Duration::from_millis(200)),
+                duration: Duration::ZERO,
+                interrupted: false,
+            }),
+            // A truncated Anthropic stream: usage arrived in message_start,
+            // two content deltas, but no final message_delta frame.
+            buf: concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-5\",\
+                 \"usage\":{\"input_tokens\":7,\"cache_read_input_tokens\":9000}}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hel\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"lo\"}}\n\n",
+            )
+            .as_bytes()
+            .to_vec(),
+            started: Instant::now(),
+            completed: false,
+        };
+        drop(cap);
+
+        // The insert happens on a blocking task; poll briefly.
+        for _ in 0..100 {
+            if let Ok(recs) = store.recent(0, 10)
+                && let Some(r) = recs.first()
+            {
+                assert!(r.estimated, "interrupted record must be marked estimated");
+                assert_eq!(r.input_tokens, 7);
+                assert_eq!(r.cache_read_tokens, 9000);
+                assert_eq!(r.output_tokens, 2, "output estimated from deltas");
+                assert!(r.cost_usd > 0.0);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("record was not persisted after the capture was dropped");
+    }
 }

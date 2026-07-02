@@ -97,7 +97,14 @@ are never stored — only request/response bodies and timing metadata.
 ## Install
 
 ```
-cargo install --path .        # from a checkout
+# prebuilt binary — macOS / Linux
+curl -LsSf https://github.com/Mapika/llmscope/releases/latest/download/llmscope-installer.sh | sh
+
+# prebuilt binary — Windows
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Mapika/llmscope/releases/latest/download/llmscope-installer.ps1 | iex"
+
+# via cargo
+cargo install llmscope
 ```
 
 Requires a terminal with truecolor + braille support (Windows Terminal,
