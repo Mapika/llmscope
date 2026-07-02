@@ -289,7 +289,7 @@ fn finalize(st: &AppState, ctx: FinishCtx, resp_body: Vec<u8>) {
         .clone()
         .or(ctx.req_model)
         .unwrap_or_else(|| "unknown".to_string());
-    let cost = record::cost_usd(ctx.provider, &model, &usage);
+    let cost = record::cost_usd(&model, &usage);
 
     let rec = RequestRecord {
         id: 0,

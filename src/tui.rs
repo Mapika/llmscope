@@ -1272,11 +1272,6 @@ pub fn render_demo_html(width: u16, height: u16, view: &str) -> Result<String> {
         };
 
         let status = if i == 11 { 429 } else { 200 };
-        let p = if provider == "anthropic" {
-            Provider::Anthropic
-        } else {
-            Provider::OpenAI
-        };
         // Overlap requests like an agent running parallel tool calls, so the
         // demo graph shows layered activity instead of isolated rectangles.
         age_ms += dur / 2 + 400 + jitter(35_761, 2_500);
@@ -1293,7 +1288,7 @@ pub fn render_demo_html(width: u16, height: u16, view: &str) -> Result<String> {
             cache_write_tokens: usage.cache_write,
             ttft_ms: ttft,
             duration_ms: dur,
-            cost_usd: cost_usd(p, model, &usage),
+            cost_usd: cost_usd(model, &usage),
             streamed: true,
             estimated: usage.estimated,
             session: session.to_string(),

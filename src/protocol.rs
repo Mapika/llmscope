@@ -118,6 +118,22 @@ mod tests {
         assert_eq!(s1, s2);
         assert_ne!(s1, s3);
     }
+
+    #[test]
+    fn openai_sse_picks_up_gateway_cost() {
+        // OpenRouter appends usage (with an exact cost) to the final chunk.
+        let body = concat!(
+            "data: {\"model\":\"anthropic/claude-sonnet-5\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2,\
+             \"prompt_tokens_details\":{\"cached_tokens\":8},\"cost\":0.00042}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let u = parse_response(Provider::OpenAI, true, body.as_bytes());
+        assert_eq!(u.reported_cost, Some(0.00042));
+        assert_eq!(u.input, 4);
+        assert_eq!(u.cache_read, 8);
+        assert!(!u.estimated);
+    }
 }
 
 /// Normalized usage across providers. `input` is billed, non-cached input:
@@ -131,6 +147,9 @@ pub struct Usage {
     pub cache_read: i64,
     pub cache_write: i64,
     pub estimated: bool,
+    /// Exact USD cost when the gateway reports one (OpenRouter puts it in
+    /// `usage.cost` on every response); first-party APIs never send this.
+    pub reported_cost: Option<f64>,
 }
 
 pub fn parse_response(provider: Provider, is_sse: bool, body: &[u8]) -> Usage {
@@ -194,6 +213,7 @@ fn openai_sse(body: &[u8]) -> Usage {
             u.input = i64_at(usage, "prompt_tokens") - cached;
             u.cache_read = cached;
             u.output = i64_at(usage, "completion_tokens");
+            u.reported_cost = usage.get("cost").and_then(Value::as_f64);
             found_usage = true;
         }
     }
@@ -231,6 +251,7 @@ fn json_usage(provider: Provider, body: &[u8]) -> Usage {
             u.input = i64_at(usage, "prompt_tokens") - cached;
             u.cache_read = cached;
             u.output = i64_at(usage, "completion_tokens");
+            u.reported_cost = usage.get("cost").and_then(Value::as_f64);
         }
     }
     u

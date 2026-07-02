@@ -1,4 +1,5 @@
 mod diff;
+mod prices;
 mod protocol;
 mod proxy;
 mod record;

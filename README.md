@@ -28,8 +28,11 @@ is nothing to instrument. Responses stream through untouched — llmscope tees
 the bytes, parses the SSE stream on the side, and records:
 
 - **tokens** — input / output / cache reads / cache writes, per request
-- **cost** — priced per model, including cache read/write multipliers
-  (gateway-served Claude models are priced correctly too)
+- **cost** — priced per model with per-model cache read/write rates, from a
+  built-in table generated off [LiteLLM's community pricing data](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)
+  (`python scripts/update_prices.py` refreshes it); when a gateway reports
+  the exact cost — OpenRouter sends `usage.cost` on every response — that
+  number wins over the table
 - **latency** — time-to-first-token vs. total generation time
 - **sessions** — conversations are fingerprinted, so parallel agents and
   side calls (title generators, summarizers) are tracked separately
@@ -102,7 +105,7 @@ iTerm2, kitty, most modern terminals).
 
 ## Roadmap
 
-- [ ] pricing table via config file (built-ins cover common models)
+- [ ] pricing overrides via config file (built-ins regenerate from LiteLLM's table)
 - [ ] web UI for deep inspection and prompt diffing
 - [ ] OTLP export
 - [ ] request replay
