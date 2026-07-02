@@ -37,6 +37,10 @@ const PRICES: &[(&str, f64, f64)] = &[
     ("claude-haiku-4", 1.0, 5.0),
     ("claude-3-5-sonnet", 3.0, 15.0),
     ("claude-3-5-haiku", 0.8, 4.0),
+    // Gateways sometimes emit version-first slugs ("claude-4.5-haiku-20251001").
+    ("claude-4.5-haiku", 1.0, 5.0),
+    ("claude-4.5-sonnet", 3.0, 15.0),
+    ("claude-4.6-sonnet", 3.0, 15.0),
     ("gpt-4o-mini", 0.15, 0.6),
     ("gpt-4o", 2.5, 10.0),
     ("gpt-4.1-nano", 0.1, 0.4),
@@ -62,11 +66,15 @@ pub fn cost_usd(provider: Provider, model: &str, usage: &Usage) -> f64 {
     let Some((pin, pout)) = price(model) else {
         return 0.0;
     };
-    let (read_mult, write_mult) = match provider {
+    // Claude served through an OpenAI-protocol gateway (OpenRouter etc.) still
+    // bills with Anthropic's cache multipliers.
+    let anthropic_pricing = provider == Provider::Anthropic || model.contains("claude");
+    let (read_mult, write_mult) = if anthropic_pricing {
         // Anthropic: cache reads 0.1x, cache writes 1.25x the input price.
-        Provider::Anthropic => (0.1, 1.25),
+        (0.1, 1.25)
+    } else {
         // OpenAI: cached input is half price; there is no write surcharge.
-        Provider::OpenAI => (0.5, 1.0),
+        (0.5, 1.0)
     };
     (usage.input as f64 * pin
         + usage.cache_read as f64 * read_mult * pin
