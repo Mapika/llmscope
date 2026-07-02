@@ -3,8 +3,9 @@ use serde_json::Value;
 use crate::protocol::Provider;
 
 /// One conversation message, reduced to what the diff needs. `fp` is a
-/// fingerprint of the full serialized message, so any rewrite — even a
-/// one-character edit deep in a tool result — breaks prefix matching.
+/// fingerprint of the serialized message minus `cache_control`, so any real
+/// rewrite — even a one-character edit deep in a tool result — breaks prefix
+/// matching, while a breakpoint moving between turns does not.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Msg {
     pub role: String,
@@ -78,6 +79,38 @@ fn extract_text(v: &Value, out: &mut String) {
     }
 }
 
+/// Serialize into a cache-equivalent canonical form: `cache_control` is
+/// stripped at every depth, and a bare-string `content` becomes a single
+/// text block. Clients re-anchor breakpoints every turn and flip between
+/// the two content serializations, and the API caches on tokenized content
+/// where both pairs are identical — neither must fingerprint as a rewrite.
+fn stable_json(v: &Value) -> String {
+    fn strip(v: &mut Value) {
+        match v {
+            Value::Object(map) => {
+                map.remove("cache_control");
+                if let Some(c) = map.get_mut("content")
+                    && let Value::String(s) = c
+                {
+                    *c = serde_json::json!([{ "type": "text", "text": std::mem::take(s) }]);
+                }
+                for item in map.values_mut() {
+                    strip(item);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    strip(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut owned = v.clone();
+    strip(&mut owned);
+    serde_json::to_string(&owned).unwrap_or_default()
+}
+
 fn clean_preview(raw: &str) -> String {
     let joined: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut p: String = joined.chars().take(70).collect();
@@ -117,7 +150,7 @@ pub fn parse_convo(_provider: Provider, body: &str) -> Option<Convo> {
 
     let mut messages = Vec::with_capacity(raw_msgs.len());
     for m in raw_msgs {
-        let raw = serde_json::to_string(m).unwrap_or_default();
+        let raw = stable_json(m);
         let mut text = String::new();
         extract_text(m.get("content").unwrap_or(&Value::Null), &mut text);
         if text.trim().is_empty() {
@@ -157,7 +190,7 @@ pub fn parse_convo(_provider: Provider, body: &str) -> Option<Convo> {
     // protocol it is messages[0] and diffs as a normal message.
     let (system_chars, system_fp, system_text) = match v.get("system") {
         Some(s) => {
-            let raw = serde_json::to_string(s).unwrap_or_default();
+            let raw = stable_json(s);
             let mut text = String::new();
             crate::protocol::canonical_text(s, &mut text);
             (raw.len(), fnv1a(raw.as_bytes()), text)
@@ -167,7 +200,7 @@ pub fn parse_convo(_provider: Provider, body: &str) -> Option<Convo> {
     let (tools_count, tools_chars, tools_fp, tools) = match v.get("tools").and_then(Value::as_array)
     {
         Some(ts) => {
-            let raw = serde_json::to_string(ts).unwrap_or_default();
+            let raw = stable_json(&Value::Array(ts.clone()));
             let list = ts
                 .iter()
                 .map(|t| {
@@ -177,7 +210,7 @@ pub fn parse_convo(_provider: Provider, body: &str) -> Option<Convo> {
                         .or_else(|| t.pointer("/function/name").and_then(Value::as_str))
                         .unwrap_or("?")
                         .to_string();
-                    let raw_t = serde_json::to_string(t).unwrap_or_default();
+                    let raw_t = stable_json(t);
                     (name, fnv1a(raw_t.as_bytes()))
                 })
                 .collect();
@@ -478,6 +511,52 @@ mod tests {
         let d = diff(&p, &c);
         let causes = diagnose_miss(&p, &c, &d, false, 1_000);
         assert_eq!(causes, vec![MissCause::HistoryRewritten { at_msg: 0 }]);
+    }
+
+    #[test]
+    fn moving_cache_breakpoint_is_not_a_rewrite() {
+        // opencode-style: the previous last message loses its breakpoint,
+        // the new last message gains it. Prefix must survive.
+        let prev = anthropic_body(
+            r#"{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}"#,
+        );
+        let curr = anthropic_body(
+            r#"{"role":"user","content":[{"type":"text","text":"hi"}]},{"role":"assistant","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}"#,
+        );
+        let (p, c) = (convo(&prev), convo(&curr));
+        let d = diff(&p, &c);
+        assert_eq!(d.kept, 1);
+        assert!(d.dropped.is_empty());
+        assert_eq!(d.appended.len(), 1);
+    }
+
+    #[test]
+    fn string_vs_parts_serialization_is_not_a_rewrite() {
+        let prev = anthropic_body(r#"{"role":"user","content":"hi"}"#);
+        let curr = anthropic_body(
+            r#"{"role":"user","content":[{"type":"text","text":"hi"}]},{"role":"assistant","content":"hello"}"#,
+        );
+        let (p, c) = (convo(&prev), convo(&curr));
+        let d = diff(&p, &c);
+        assert_eq!(d.kept, 1);
+        assert!(d.dropped.is_empty());
+        assert_eq!(d.appended.len(), 1);
+    }
+
+    #[test]
+    fn breakpoint_moves_in_system_and_tools_are_ignored() {
+        let body = |cc: &str| {
+            format!(
+                r#"{{"model":"m","system":[{{"type":"text","text":"stable"{cc}}}],
+                    "tools":[{{"name":"bash","description":"stable"{cc}}}],
+                    "messages":[{{"role":"user","content":"hi"}}]}}"#
+            )
+        };
+        let with = r#","cache_control":{"type":"ephemeral"}"#;
+        let (prev, curr) = (convo(&body(with)), convo(&body("")));
+        let d = diff(&prev, &curr);
+        assert!(!d.system_changed);
+        assert!(!d.tools_changed);
     }
 
     #[test]

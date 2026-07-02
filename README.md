@@ -147,6 +147,11 @@ input = 0.2          # $/Mtok
 output = 0.8         # cache_read / cache_write optional, default to input
 ```
 
+One gateway caveat: the OpenAI protocol has no field for cache *write*
+tokens, so gateways like OpenRouter report reads (and exact cost) but
+writes always show as 0 — the cache-economics "wasted" figure can
+undercount on that path.
+
 ## Install
 
 ```
