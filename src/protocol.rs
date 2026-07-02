@@ -51,7 +51,13 @@ pub fn parse_request(body: &[u8]) -> ReqInfo {
 }
 
 fn session_fingerprint(v: &Value) -> String {
-    let Some(messages) = v.get("messages").and_then(Value::as_array) else {
+    // Chat protocols carry `messages`; the OpenAI Responses API (Codex)
+    // carries `input` items with a separate `instructions` string.
+    let Some(messages) = v
+        .get("messages")
+        .or_else(|| v.get("input"))
+        .and_then(Value::as_array)
+    else {
         return String::new();
     };
     // Hash extracted TEXT, not JSON: clients re-serialize the same message
@@ -60,7 +66,7 @@ fn session_fingerprint(v: &Value) -> String {
     let mut canon = String::new();
     // Anthropic keeps the system prompt in a separate field; in the OpenAI
     // protocol it is a leading system/developer message.
-    if let Some(system) = v.get("system") {
+    if let Some(system) = v.get("system").or_else(|| v.get("instructions")) {
         canonical_text(system, &mut canon);
     }
     let mut anchor = None;
@@ -125,6 +131,37 @@ mod tests {
         assert!(!s1.is_empty());
         assert_eq!(s1, s2);
         assert_ne!(s1, s3);
+    }
+
+    #[test]
+    fn responses_api_usage_and_fingerprint() {
+        // Codex speaks the Responses API: usage arrives nested in the
+        // response.completed event with input/output naming.
+        let body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"anthropic/claude-haiku-4.5\",\
+             \"usage\":{\"input_tokens\":100,\"input_tokens_details\":{\"cached_tokens\":80},\
+             \"output_tokens\":7,\"cost\":0.00021}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let u = parse_response(Provider::OpenAI, true, body.as_bytes());
+        assert_eq!(u.input, 20);
+        assert_eq!(u.cache_read, 80);
+        assert_eq!(u.output, 7);
+        assert_eq!(u.reported_cost, Some(0.00021));
+        assert!(!u.estimated);
+        assert_eq!(u.model.as_deref(), Some("anthropic/claude-haiku-4.5"));
+
+        let req = br#"{"model":"m","instructions":"be a coding agent",
+            "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the bug"}]},
+                     {"type":"message","role":"assistant","content":[{"type":"output_text","text":"on it"}]}]}"#;
+        let s = parse_request(req).session;
+        assert!(!s.is_empty());
+        // Equivalent conversation over chat completions groups identically.
+        let chat = br#"{"model":"m","messages":[
+            {"role":"system","content":"be a coding agent"},
+            {"role":"user","content":"fix the bug"}]}"#;
+        assert_eq!(s, parse_request(chat).session);
     }
 
     #[test]
@@ -218,19 +255,24 @@ fn openai_sse(body: &[u8]) -> Usage {
     let mut content_chunks: i64 = 0;
     for v in sse_data_events(body) {
         if u.model.is_none() {
-            u.model = v.get("model").and_then(Value::as_str).map(str::to_string);
+            u.model = v
+                .get("model")
+                .and_then(Value::as_str)
+                .or_else(|| v["response"]["model"].as_str())
+                .map(str::to_string);
         }
-        if v["choices"][0]["delta"]["content"].is_string() {
+        if v["choices"][0]["delta"]["content"].is_string()
+            || v.get("type").and_then(Value::as_str) == Some("response.output_text.delta")
+        {
             content_chunks += 1;
         }
-        let usage = &v["usage"];
-        if usage.is_object() {
-            let cached = i64_at(&usage["prompt_tokens_details"], "cached_tokens");
-            u.input = i64_at(usage, "prompt_tokens") - cached;
-            u.cache_read = cached;
-            u.output = i64_at(usage, "completion_tokens");
-            u.reported_cost = usage.get("cost").and_then(Value::as_f64);
-            found_usage = true;
+        // Chat completions puts usage at the event's top level; the
+        // Responses API nests it inside the `response.completed` event.
+        for usage in [&v["usage"], &v["response"]["usage"]] {
+            if usage.is_object() {
+                openai_usage(&mut u, usage);
+                found_usage = true;
+            }
         }
     }
     if !found_usage {
@@ -241,6 +283,22 @@ fn openai_sse(body: &[u8]) -> Usage {
         u.estimated = true;
     }
     u
+}
+
+/// Both OpenAI wire formats, one meaning: chat completions names the fields
+/// prompt/completion, the Responses API names them input/output. Cached
+/// tokens are a subset of the prompt total in both.
+fn openai_usage(u: &mut Usage, usage: &Value) {
+    let (in_key, out_key, details_key) = if usage.get("prompt_tokens").is_some() {
+        ("prompt_tokens", "completion_tokens", "prompt_tokens_details")
+    } else {
+        ("input_tokens", "output_tokens", "input_tokens_details")
+    };
+    let cached = i64_at(&usage[details_key], "cached_tokens");
+    u.input = i64_at(usage, in_key) - cached;
+    u.cache_read = cached;
+    u.output = i64_at(usage, out_key);
+    u.reported_cost = usage.get("cost").and_then(Value::as_f64);
 }
 
 fn json_usage(provider: Provider, body: &[u8]) -> Usage {
@@ -262,13 +320,7 @@ fn json_usage(provider: Provider, body: &[u8]) -> Usage {
             u.cache_read = i64_at(usage, "cache_read_input_tokens");
             u.cache_write = i64_at(usage, "cache_creation_input_tokens");
         }
-        Provider::OpenAI => {
-            let cached = i64_at(&usage["prompt_tokens_details"], "cached_tokens");
-            u.input = i64_at(usage, "prompt_tokens") - cached;
-            u.cache_read = cached;
-            u.output = i64_at(usage, "completion_tokens");
-            u.reported_cost = usage.get("cost").and_then(Value::as_f64);
-        }
+        Provider::OpenAI => openai_usage(&mut u, usage),
     }
     u
 }

@@ -146,7 +146,9 @@ fn message_kind(m: &Value) -> String {
 
 pub fn parse_convo(_provider: Provider, body: &str) -> Option<Convo> {
     let v: Value = serde_json::from_str(body).ok()?;
-    let raw_msgs = v.get("messages")?.as_array()?;
+    // Chat protocols carry `messages`; the Responses API (Codex) carries
+    // `input` items with `instructions` as the system prompt.
+    let raw_msgs = v.get("messages").or_else(|| v.get("input"))?.as_array()?;
 
     let mut messages = Vec::with_capacity(raw_msgs.len());
     for m in raw_msgs {
@@ -188,7 +190,7 @@ pub fn parse_convo(_provider: Provider, body: &str) -> Option<Convo> {
 
     // Anthropic keeps the system prompt in a separate field; in the OpenAI
     // protocol it is messages[0] and diffs as a normal message.
-    let (system_chars, system_fp, system_text) = match v.get("system") {
+    let (system_chars, system_fp, system_text) = match v.get("system").or_else(|| v.get("instructions")) {
         Some(s) => {
             let raw = stable_json(s);
             let mut text = String::new();

@@ -116,6 +116,9 @@ llmscope serve --openai-upstream https://openrouter.ai/api
 
 # Local models: Ollama, vLLM, llama.cpp
 llmscope run --openai-upstream http://127.0.0.1:11434 -- python my_agent.py
+
+# Codex CLI: add a model provider with base_url http://127.0.0.1:4040/openai/v1
+# — both chat completions and the Responses API are understood
 ```
 
 ## Overhead
