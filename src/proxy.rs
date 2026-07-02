@@ -177,6 +177,7 @@ async fn proxy_handler(State(st): State<Arc<AppState>>, req: Request) -> Respons
                     status: 502,
                     streamed: req_info.stream,
                     req_model: req_info.model,
+                    session: req_info.session,
                     req_body: body_bytes,
                     is_sse: false,
                     ttft: None,
@@ -213,6 +214,7 @@ async fn proxy_handler(State(st): State<Arc<AppState>>, req: Request) -> Respons
         status: status.as_u16() as i64,
         streamed: is_sse,
         req_model: req_info.model,
+        session: req_info.session,
         req_body: body_bytes,
         is_sse,
         ttft: None,
@@ -264,6 +266,7 @@ struct FinishCtx {
     status: i64,
     streamed: bool,
     req_model: Option<String>,
+    session: String,
     req_body: Bytes,
     is_sse: bool,
     ttft: Option<Duration>,
@@ -300,6 +303,7 @@ fn finalize(st: &AppState, ctx: FinishCtx, resp_body: Vec<u8>) {
         cost_usd: cost,
         streamed: ctx.streamed,
         estimated: usage.estimated,
+        session: ctx.session,
     };
 
     let store = Arc::clone(&st.store);

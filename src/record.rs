@@ -25,6 +25,10 @@ pub struct RequestRecord {
     pub streamed: bool,
     /// True when the provider sent no usage block and numbers are heuristic.
     pub estimated: bool,
+    /// Conversation fingerprint grouping requests of one agent run; empty
+    /// for non-chat requests and rows captured before this field existed.
+    #[serde(default)]
+    pub session: String,
 }
 
 /// $/Mtok (input, output), matched by model-name prefix. More specific

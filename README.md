@@ -60,10 +60,13 @@ are never stored — only request/response bodies and timing metadata.
 
 ## Status
 
-Early. Core proxy + TUI + turn diff work. Planned next:
+Early. Core proxy + TUI + turn diff + session grouping work. Planned next:
 
 - [x] **turn diff** — see exactly what your agent re-sends every turn
-- [ ] denser dashboard: per-model spend meters, context-growth graph
+- [x] **session grouping** — conversations fingerprinted and tracked
+  separately, so a title agent doesn't muddy your main loop's stats
+- [x] dense dashboard: sessions panel, per-model spend meters,
+  context-growth graph, latency/health sidebar
 - [ ] cache-miss cost analysis ("this session wasted $X on cache misses")
 - [ ] request detail / body viewer in the TUI
 - [ ] web UI for deep inspection

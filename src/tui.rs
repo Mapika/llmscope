@@ -37,6 +37,15 @@ const TOKENS_STOPS: &[(u8, u8, u8)] = &[
 const TTFT_STOPS: &[(u8, u8, u8)] = &[(74, 222, 128), (250, 204, 21), (248, 113, 113)];
 /// Cache meter fill, left → right (a full bar ends green).
 const CACHE_STOPS: &[(u8, u8, u8)] = &[(248, 113, 113), (250, 204, 21), (74, 222, 128)];
+/// Stable per-session accents, assigned in order of first appearance.
+const SESSION_COLORS: [Color; 6] = [
+    Color::Rgb(34, 211, 238),
+    Color::Rgb(167, 139, 250),
+    Color::Rgb(52, 211, 153),
+    Color::Rgb(251, 191, 36),
+    Color::Rgb(244, 114, 182),
+    Color::Rgb(56, 189, 248),
+];
 /// Context-growth area graph, bottom → top: gold into warning red.
 const CONTEXT_STOPS: &[(u8, u8, u8)] = &[(202, 138, 4), (245, 158, 11), (248, 113, 113)];
 
@@ -109,43 +118,6 @@ impl Widget for AreaGraph<'_> {
                     let ch = char::from_u32(0x2800 + bits as u32).unwrap_or(' ');
                     buf[(area.x + cx, area.y + cy)].set_char(ch).set_fg(color);
                 }
-            }
-        }
-    }
-}
-
-/// One bar per value using eighth-block characters, each bar colored by its
-/// own magnitude (green = fast, red = slow). Newest right-aligned.
-struct GradientBars<'a> {
-    data: &'a [u64],
-    stops: &'a [(u8, u8, u8)],
-}
-
-impl Widget for GradientBars<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        const EIGHTHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-        let max = self.data.iter().copied().max().unwrap_or(0).max(1);
-        let cols = area.width as usize;
-        let n = self.data.len().min(cols);
-
-        for (i, v) in self.data[self.data.len() - n..].iter().enumerate() {
-            let frac = *v as f32 / max as f32;
-            let color = gradient(self.stops, frac);
-            let total_eighths =
-                ((frac * area.height as f32 * 8.0).round() as usize).max(if *v > 0 { 1 } else { 0 });
-            let x = area.x + (cols - n + i) as u16;
-            for cy in 0..area.height {
-                // cy counted from the bottom row upward
-                let y = area.y + area.height - 1 - cy;
-                let cell_eighths = total_eighths.saturating_sub(cy as usize * 8);
-                if cell_eighths == 0 {
-                    continue;
-                }
-                let ch = EIGHTHS[cell_eighths.min(8) - 1];
-                buf[(x, y)].set_char(ch).set_fg(color);
             }
         }
     }
@@ -346,9 +318,12 @@ fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Dense btop-style grid when there is room; the second panel row folds
-    // away on short terminals to keep the request table usable.
+    // Mission-control grid. The second panel row folds away on short
+    // terminals; the sidebar folds away on narrow ones.
     let dense = f.area().height >= 34;
+    let wide = f.area().width >= 110;
+    let labels = session_labels(&app.records);
+
     let mut constraints = vec![Constraint::Length(3), Constraint::Length(9)];
     if dense {
         constraints.push(Constraint::Length(8));
@@ -356,7 +331,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     constraints.extend([Constraint::Min(4), Constraint::Length(1)]);
     let chunks = Layout::vertical(constraints).split(f.area());
     let (header, graphs) = (chunks[0], chunks[1]);
-    let (second, table, footer) = if dense {
+    let (second, main, footer) = if dense {
         (Some(chunks[2]), chunks[3], chunks[4])
     } else {
         (None, chunks[2], chunks[3])
@@ -369,13 +344,24 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_tokens_per_sec(f, app, left);
     draw_ttft(f, app, right);
     if let Some(second) = second {
-        let [ctx, models] =
+        let [ctx, sessions] =
             Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .areas(second);
-        draw_context_growth(f, app, ctx);
-        draw_models(f, app, models);
+        draw_context_growth(f, app, &labels, ctx);
+        draw_sessions(f, app, &labels, sessions);
     }
-    draw_table(f, app, table);
+    if wide {
+        let [table, sidebar] =
+            Layout::horizontal([Constraint::Min(60), Constraint::Length(42)]).areas(main);
+        let [models, latency] =
+            Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .areas(sidebar);
+        draw_table(f, app, &labels, table);
+        draw_models(f, app, models);
+        draw_latency(f, app, latency);
+    } else {
+        draw_table(f, app, &labels, main);
+    }
 
     f.render_widget(
         Line::from(vec![
@@ -719,24 +705,31 @@ fn draw_tokens_per_sec(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// TTFT per request as a braille area graph, one value per turn stretched
+/// across the panel. Vertical green→red gradient: slow spikes get red tips.
 fn draw_ttft(f: &mut Frame, app: &App, area: Rect) {
     let inner_w = area.width.saturating_sub(2).max(1) as usize;
-    // Newest on the right, one bar per request.
-    let data: Vec<u64> = {
-        let mut v: Vec<u64> = app
-            .records
-            .iter()
-            .filter(|r| r.ttft_ms >= 0)
-            .take(inner_w)
-            .map(|r| r.ttft_ms as u64)
-            .collect();
-        v.reverse();
-        v
-    };
-    let avg = if data.is_empty() {
+    let mut vals: Vec<u64> = app
+        .records
+        .iter()
+        .filter(|r| r.ttft_ms >= 0)
+        .take(inner_w * 2)
+        .map(|r| r.ttft_ms as u64)
+        .collect();
+    vals.reverse();
+    let avg = if vals.is_empty() {
         0
     } else {
-        data.iter().sum::<u64>() / data.len() as u64
+        vals.iter().sum::<u64>() / vals.len() as u64
+    };
+
+    let dot_cols = inner_w * 2;
+    let data: Vec<u64> = if vals.is_empty() {
+        Vec::new()
+    } else {
+        (0..dot_cols)
+            .map(|i| vals[i * vals.len() / dot_cols])
+            .collect()
     };
 
     let block = panel(vec![
@@ -746,22 +739,53 @@ fn draw_ttft(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(
-        GradientBars {
+        AreaGraph {
             data: &data,
             stops: TTFT_STOPS,
+            baseline: true,
         },
         inner,
     );
 }
 
-/// Total input (billed + cached + written) per request over time — the shape
-/// of the agent's context growing turn by turn. One character column per
-/// request, newest right.
-fn draw_context_growth(f: &mut Frame, app: &App, area: Rect) {
+type SessionLabels = std::collections::HashMap<String, (String, Color)>;
+
+/// s1, s2, … in order of first appearance, each with a stable accent color.
+fn session_labels(records: &VecDeque<RequestRecord>) -> SessionLabels {
+    let mut map = SessionLabels::new();
+    for r in records.iter().rev() {
+        if r.session.is_empty() || map.contains_key(&r.session) {
+            continue;
+        }
+        let idx = map.len();
+        map.insert(
+            r.session.clone(),
+            (format!("s{}", idx + 1), SESSION_COLORS[idx % SESSION_COLORS.len()]),
+        );
+    }
+    map
+}
+
+fn session_tag(labels: &SessionLabels, session: &str) -> (String, Color) {
+    labels
+        .get(session)
+        .cloned()
+        .unwrap_or_else(|| ("—".to_string(), DIM))
+}
+
+/// Total input (billed + cached + written) per turn of ONE conversation —
+/// the selected row's session — so interleaved agents don't muddy the shape.
+fn draw_context_growth(f: &mut Frame, app: &App, labels: &SessionLabels, area: Rect) {
+    let selected_session = app
+        .records
+        .get(app.selected)
+        .map(|r| r.session.clone())
+        .unwrap_or_default();
     let inner_w = area.width.saturating_sub(2).max(1) as usize;
     let mut vals: Vec<u64> = app
         .records
         .iter()
+        .filter(|r| selected_session.is_empty() || r.session == selected_session)
         .take(inner_w * 2)
         .map(|r| (r.input_tokens + r.cache_read_tokens + r.cache_write_tokens).max(0) as u64)
         .collect();
@@ -778,8 +802,10 @@ fn draw_context_growth(f: &mut Frame, app: &App, area: Rect) {
             .collect()
     };
 
+    let (tag, tag_color) = session_tag(labels, &selected_session);
     let block = panel(vec![
         Span::styled(" context per turn ", Style::new().bold()),
+        Span::styled(format!("▍{tag} "), Style::new().fg(tag_color).bold()),
         Span::styled(format!("now {} tok ", fmt_tokens(latest as i64)), Style::new().fg(DIM)),
     ]);
     let inner = block.inner(area);
@@ -792,6 +818,151 @@ fn draw_context_growth(f: &mut Frame, app: &App, area: Rect) {
         },
         inner,
     );
+}
+
+/// One row per agent conversation, newest first — btop's process list.
+fn draw_sessions(f: &mut Frame, app: &App, labels: &SessionLabels, area: Rect) {
+    struct Agg {
+        last_id: i64,
+        model: String,
+        reqs: usize,
+        total_in: i64,
+        out: i64,
+        cache_read: i64,
+        spend: f64,
+    }
+    let mut agg: std::collections::HashMap<&str, Agg> = std::collections::HashMap::new();
+    for r in &app.records {
+        if r.session.is_empty() {
+            continue;
+        }
+        let e = agg.entry(r.session.as_str()).or_insert(Agg {
+            last_id: r.id,
+            model: r.model.clone(),
+            reqs: 0,
+            total_in: 0,
+            out: 0,
+            cache_read: 0,
+            spend: 0.0,
+        });
+        e.last_id = e.last_id.max(r.id);
+        e.reqs += 1;
+        e.total_in += r.input_tokens + r.cache_read_tokens + r.cache_write_tokens;
+        e.out += r.output_tokens;
+        e.cache_read += r.cache_read_tokens;
+        e.spend += r.cost_usd;
+    }
+    let mut sessions: Vec<(&str, Agg)> = agg.into_iter().collect();
+    sessions.sort_by(|a, b| b.1.last_id.cmp(&a.1.last_id));
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let lines: Vec<Line> = sessions
+        .iter()
+        .take(visible)
+        .map(|(key, a)| {
+            let (tag, color) = session_tag(labels, key);
+            let model: String = a
+                .model
+                .rsplit('/')
+                .next()
+                .unwrap_or(&a.model)
+                .chars()
+                .take(17)
+                .collect();
+            let hit = if a.total_in > 0 {
+                a.cache_read as f64 / a.total_in as f64
+            } else {
+                0.0
+            };
+            let mut spans = vec![
+                Span::styled(format!(" ▍{tag:<3}"), Style::new().fg(color).bold()),
+                Span::styled(format!("{model:<18}"), Style::new().fg(Color::Rgb(150, 156, 170))),
+                Span::styled(format!("{:>3}r ", a.reqs), Style::new().fg(DIM)),
+                Span::raw(format!("{:>7} ", fmt_tokens(a.total_in))),
+                Span::styled(
+                    format!("{:>7} ", fmt_cost(a.spend)),
+                    Style::new().fg(Color::Rgb(74, 222, 128)),
+                ),
+            ];
+            spans.extend(meter_spans(hit, 5, CACHE_STOPS));
+            spans.push(Span::styled(
+                format!(" {:>3.0}%", hit * 100.0),
+                Style::new().fg(DIM),
+            ));
+            Line::from(spans)
+        })
+        .collect();
+
+    let block = panel(vec![
+        Span::styled(" sessions ", Style::new().bold()),
+        Span::styled(format!("{} live ", sessions.len()), Style::new().fg(DIM)),
+    ]);
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Latency and health summary for the sidebar.
+fn draw_latency(f: &mut Frame, app: &App, area: Rect) {
+    let mut ttfts: Vec<i64> = app
+        .records
+        .iter()
+        .filter(|r| r.ttft_ms >= 0)
+        .map(|r| r.ttft_ms)
+        .collect();
+    ttfts.sort_unstable();
+    let avg_ttft = if ttfts.is_empty() {
+        0
+    } else {
+        ttfts.iter().sum::<i64>() / ttfts.len() as i64
+    };
+    let p95_ttft = ttfts
+        .get((ttfts.len().saturating_sub(1)) * 95 / 100)
+        .copied()
+        .unwrap_or(0);
+
+    let mut rates: Vec<f64> = app
+        .records
+        .iter()
+        .filter(|r| r.output_tokens > 0 && r.duration_ms > r.ttft_ms.max(0))
+        .map(|r| r.output_tokens as f64 / ((r.duration_ms - r.ttft_ms.max(0)) as f64 / 1000.0))
+        .collect();
+    rates.sort_unstable_by(|a, b| a.total_cmp(b));
+    let avg_rate = if rates.is_empty() {
+        0.0
+    } else {
+        rates.iter().sum::<f64>() / rates.len() as f64
+    };
+
+    let errors = app.records.iter().filter(|r| r.status >= 400 || r.status == 0).count();
+    let estimated = app.records.iter().filter(|r| r.estimated).count();
+
+    let value = |s: String| Span::styled(s, Style::new().bold());
+    let lines = vec![
+        stat_line("ttft", vec![
+            value(fmt_ms(avg_ttft)),
+            Span::styled(" avg · ", Style::new().fg(DIM)),
+            value(fmt_ms(p95_ttft)),
+            Span::styled(" p95", Style::new().fg(DIM)),
+        ]),
+        stat_line("gen", vec![
+            value(format!("{avg_rate:.0} tok/s")),
+            Span::styled(" avg", Style::new().fg(DIM)),
+        ]),
+        stat_line("errors", vec![Span::styled(
+            errors.to_string(),
+            if errors > 0 {
+                Style::new().fg(Color::Rgb(248, 113, 113)).bold()
+            } else {
+                Style::new().fg(Color::Rgb(74, 222, 128)).bold()
+            },
+        )]),
+        stat_line("est rows", vec![
+            value(estimated.to_string()),
+            Span::styled(" (~)", Style::new().fg(DIM)),
+        ]),
+    ];
+
+    let block = panel(vec![Span::styled(" health ", Style::new().bold())]);
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Per-model spend, btop per-core style: meter is the share of the most
@@ -814,9 +985,9 @@ fn draw_models(f: &mut Frame, app: &App, area: Rect) {
     let max_spend = models.first().map(|m| m.2).unwrap_or(0.0).max(1e-9);
 
     let inner_w = area.width.saturating_sub(2).max(1) as usize;
-    let name_w = 22usize;
-    let value_w = 18usize;
-    let meter_w = inner_w.saturating_sub(name_w + value_w).clamp(6, 30);
+    let name_w = if inner_w >= 56 { 22usize } else { 17 };
+    let value_w = 15usize;
+    let meter_w = inner_w.saturating_sub(name_w + value_w).clamp(4, 30);
 
     let visible = area.height.saturating_sub(2) as usize;
     let lines: Vec<Line> = models
@@ -839,7 +1010,7 @@ fn draw_models(f: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(Color::Rgb(74, 222, 128)),
             ));
             spans.push(Span::styled(
-                format!(" · {} tok", fmt_tokens(*tok)),
+                format!(" · {}", fmt_tokens(*tok)),
                 Style::new().fg(DIM),
             ));
             Line::from(spans)
@@ -853,14 +1024,15 @@ fn draw_models(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_table(f: &mut Frame, app: &mut App, labels: &SessionLabels, area: Rect) {
     let header = Row::new(
-        ["TIME", "MODEL", "IN", "CACHE", "OUT", "TTFT", "TOTAL", "COST"]
+        ["TIME", "SESS", "MODEL", "IN", "CACHE", "OUT", "TTFT", "TOTAL", "COST"]
             .into_iter()
             .map(|h| Cell::from(h).style(Style::new().fg(DIM).add_modifier(Modifier::BOLD))),
     );
 
     let rows = app.records.iter().take(1000).enumerate().map(|(i, r)| {
+        let (tag, tag_color) = session_tag(labels, &r.session);
         let time = Local
             .timestamp_millis_opt(r.ts_ms)
             .single()
@@ -888,6 +1060,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let row = Row::new(vec![
             Cell::from(time).style(Style::new().fg(DIM)),
+            Cell::from(format!("▍{tag}")).style(Style::new().fg(tag_color).bold()),
             Cell::from(format!("{}{}", r.model, status_note)).style(model_style),
             Cell::from(format!("{approx}{}", fmt_tokens(total_in))),
             Cell::from(cache_pct),
@@ -907,7 +1080,8 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         rows,
         [
             Constraint::Length(8),
-            Constraint::Min(20),
+            Constraint::Length(4),
+            Constraint::Min(18),
             Constraint::Length(8),
             Constraint::Length(6),
             Constraint::Length(8),
@@ -979,7 +1153,7 @@ pub fn render_demo_html(width: u16, height: u16, view: &str) -> Result<String> {
             (((i + 1).wrapping_mul(salt).wrapping_mul(2654435761) >> 13) % span) as i64
         };
 
-        let (provider, model, usage, ttft, dur) = if i % 7 == 3 {
+        let (provider, model, usage, ttft, dur, session) = if i % 7 == 3 {
             let u = Usage {
                 input: 900 + jitter(311, 700),
                 output: 60 + jitter(997, 180),
@@ -987,7 +1161,14 @@ pub fn render_demo_html(width: u16, height: u16, view: &str) -> Result<String> {
                 cache_write: 0,
                 ..Usage::default()
             };
-            ("anthropic", "claude-haiku-4-5", u, 150 + jitter(613, 200), 700 + jitter(431, 900))
+            (
+                "anthropic",
+                "claude-haiku-4-5",
+                u,
+                150 + jitter(613, 200),
+                700 + jitter(431, 900),
+                "demo-side-agent",
+            )
         } else if i % 9 == 5 {
             let u = Usage {
                 input: 800 + jitter(709, 900),
@@ -995,7 +1176,14 @@ pub fn render_demo_html(width: u16, height: u16, view: &str) -> Result<String> {
                 estimated: i % 2 == 1,
                 ..Usage::default()
             };
-            ("openai", "openai/gpt-4o-mini", u, 400 + jitter(769, 500), 2_000 + jitter(577, 2_500))
+            (
+                "openai",
+                "openai/gpt-4o-mini",
+                u,
+                400 + jitter(769, 500),
+                2_000 + jitter(577, 2_500),
+                "demo-embedder",
+            )
         } else {
             let u = Usage {
                 input: 700 + jitter(367, 1_500),
@@ -1005,7 +1193,14 @@ pub fn render_demo_html(width: u16, height: u16, view: &str) -> Result<String> {
                 ..Usage::default()
             };
             let out = u.output;
-            ("anthropic", "claude-sonnet-4-5", u, 320 + jitter(613, 600), 3_000 + out * 7)
+            (
+                "anthropic",
+                "claude-sonnet-4-5",
+                u,
+                320 + jitter(613, 600),
+                3_000 + out * 7,
+                "demo-main-loop",
+            )
         };
 
         let status = if i == 11 { 429 } else { 200 };
@@ -1033,6 +1228,7 @@ pub fn render_demo_html(width: u16, height: u16, view: &str) -> Result<String> {
             cost_usd: cost_usd(p, model, &usage),
             streamed: true,
             estimated: usage.estimated,
+            session: session.to_string(),
         });
     }
 
@@ -1132,6 +1328,7 @@ fn demo_diff_payload(now_ms: i64) -> DiffPayload {
         cost_usd: 0.048,
         streamed: true,
         estimated: false,
+        session: "demo-main-loop".to_string(),
     };
     DiffPayload {
         curr: rec(47, 12_600),
@@ -1253,29 +1450,13 @@ mod tests {
     }
 
     #[test]
-    fn gradient_bars_render_ramp() {
-        let data: Vec<u64> = (0..40).map(|i| i * 25).collect();
-        let rows = render_to_strings(
-            GradientBars {
-                data: &data,
-                stops: TTFT_STOPS,
-            },
-            40,
-            5,
-        );
-        for row in &rows {
-            println!("{row}");
-        }
-        assert!(rows[4].trim_end().len() > rows[0].trim_end().len());
-    }
-
-    #[test]
-    fn gradient_bars_handle_more_data_than_width() {
+    fn area_graph_handles_more_data_than_width() {
         let data: Vec<u64> = (0..500).collect();
         render_to_strings(
-            GradientBars {
+            AreaGraph {
                 data: &data,
                 stops: TTFT_STOPS,
+                baseline: true,
             },
             20,
             4,
